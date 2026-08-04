@@ -1,7 +1,6 @@
-FROM node:18-alpine
+FROM node:20-alpine
 
-# Installer git (nécessaire pour certaines dépendances comme whatsapp-web.js)
-# et autres outils utiles (optionnel)
+# Installer git (nécessaire pour certaines dépendances)
 RUN apk add --no-cache git
 
 WORKDIR /app
@@ -10,7 +9,6 @@ WORKDIR /app
 COPY package*.json ./
 
 # Installer les dépendances (production uniquement)
-# --omit=dev fonctionne sans package-lock.json
 RUN npm install --omit=dev
 
 # Copier le code source

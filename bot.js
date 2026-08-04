@@ -7,6 +7,13 @@
  * - Toute la logique métier (Supabase, caches, XP batching)
  */
 
+// =========================================================================
+// 0. FIX CRITIQUE: POLYFILL CRYPTO POUR BAILEYS (Node.js < 19/20)
+// =========================================================================
+if (!globalThis.crypto) {
+  globalThis.crypto = require('crypto').webcrypto || require('crypto');
+}
+
 const path = require('path');
 const express = require('express');
 const QRCode = require('qrcode');
@@ -165,7 +172,6 @@ async function startSock() {
   const { version } = await fetchLatestBaileysVersion();
   console.log(`[BOOT] Version Baileys: ${version.join('.')}`);
 
-  // Correction de la variable globale sock (évite la rédéclaration locale)
   sock = makeWASocket({
     version,
     auth: state,
@@ -210,7 +216,6 @@ async function startSock() {
     }
 
     if (connection === 'close') {
-      // Correction JavaScript pur : suppression du casting TypeScript `as Boom`
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       console.log(`[DISCONNECTED] Déconnecté, code: ${statusCode}`);
       if (statusCode !== DisconnectReason.loggedOut) {
