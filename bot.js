@@ -29,8 +29,14 @@ const {
 // 1. CONFIGURATION & LOGGER VERBOSE EXHAUSTIF
 // =========================================================================
 const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  serializers: { err: pino.stdSerializers.err }
+  // 'debug' par defaut comme demande (tres verbeux, y compris les logs
+  // internes de Baileys). Repasser a 'info' ou 'warn' via LOG_LEVEL une fois
+  // le diagnostic termine, pour ne pas saturer les logs Render en continu.
+  level: process.env.LOG_LEVEL || 'debug',
+  serializers: { err: pino.stdSerializers.err },
+  transport: process.env.PRETTY_LOGS === 'false'
+    ? undefined
+    : { target: 'pino-pretty', options: { colorize: false, translateTime: 'SYS:standard' } },
 });
 
 const MAX_GROUPS = 5;
@@ -84,6 +90,7 @@ app.get('/health', (req, res) => {
     adminsBot: cachedAdmins?.size || 0,
     pendingXP: pendingXP?.size || 0,
     botNumber: BOT_NUMBER,
+    dernierMessageRecuDepuis_ms: Date.now() - lastMessageEventAt,
     memory: process.memoryUsage(),
   });
 });
@@ -184,6 +191,59 @@ function startKeepAlive(intervalMs = 5 * 60 * 1000) {
 }
 
 // =========================================================================
+// 5bis. WATCHDOG SOCKET WHATSAPP (CORRECTIF PRINCIPAL DU GEL A 10-15 MIN)
+// =========================================================================
+// Diagnostic : le socket WebSocket sous-jacent peut devenir "zombie" - coupé
+// au niveau reseau (proxy Render, NAT, etc.) SANS jamais declencher
+// l'evenement 'close' de Baileys. Dans ce cas, `isReconnecting` reste false,
+// `connection.update` ne se relance jamais, et le bot reste indefiniment
+// "connecte" selon son propre etat interne tout en ne recevant plus aucun
+// evenement. keepAliveIntervalMs (ping WebSocket interne a Baileys) est
+// censé detecter ca, mais plusieurs environnements cloud le laissent passer.
+//
+// Ce watchdog fait un vrai aller-retour reseau (sendPresenceUpdate) toutes
+// les 60s. S'il timeout ou echoue, on considere le socket mort et on force
+// un redemarrage complet - au lieu d'attendre passivement un 'close' qui
+// peut ne jamais arriver.
+const WATCHDOG_INTERVAL_MS = 60 * 1000;
+const WATCHDOG_TIMEOUT_MS = 15 * 1000;
+let watchdogTimer = null;
+let lastMessageEventAt = Date.now();
+
+function startWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  logger.info('🐕 [WATCHDOG] Démarrage de la surveillance active du socket WhatsApp (toutes les 60s).');
+
+  watchdogTimer = setInterval(async () => {
+    if (!sock || isReconnecting) {
+      logger.info('🐕 [WATCHDOG] Vérification ignorée (pas de socket actif ou reconnexion en cours).');
+      return;
+    }
+
+    const silenceMs = Date.now() - lastMessageEventAt;
+    logger.info({ silenceMs }, '🐕 [WATCHDOG] Vérification de la vivacité réelle du socket (sendPresenceUpdate)...');
+
+    try {
+      await Promise.race([
+        sock.sendPresenceUpdate('available'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout watchdog (15s)')), WATCHDOG_TIMEOUT_MS)),
+      ]);
+      logger.info('🐕 [WATCHDOG] Socket vivant (presence update OK).');
+    } catch (err) {
+      logger.error({ err, silenceMs }, '💀 [WATCHDOG] Socket semble MORT (zombie) - redémarrage forcé du socket.');
+      try {
+        sock?.end?.(new Error('watchdog: socket zombie détecté'));
+      } catch (e) {
+        logger.error({ err: e }, '⚠️ [WATCHDOG] Erreur lors de la fermeture forcée du socket mort');
+      }
+      isReconnecting = false; // s'assurer qu'on peut relancer malgré l'etat precedent
+      startSock().catch(e => logger.error({ err: e }, '💥 [WATCHDOG] Échec du redémarrage forcé'));
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
+startWatchdog();
+
+// =========================================================================
 // 6. PERMISSIONS ET UTILITAIRES DE NUMÉRO
 // =========================================================================
 function numberFromJid(jid) {
@@ -264,7 +324,11 @@ async function startSock() {
     syncFullHistory: false,
     fireInitQueries: false,
     markOnlineOnConnect: false,
-    emitOwnEvents: false,
+    // CORRIGÉ : `false` empêchait les messages envoyés par le numéro du bot
+    // lui-même de déclencher 'messages.upsert' - or c'est justement le cas
+    // d'usage central de ce bot (numéro du bot = numéro utilisé pour taper
+    // les commandes /activer-groupe, etc.).
+    emitOwnEvents: true,
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
@@ -343,6 +407,7 @@ async function startSock() {
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
+    lastMessageEventAt = Date.now();
     logger.info({ messageCount: messages.length, upsertType: type }, '📩 [RECEPTION] Réception d\'un paquet de messages');
     if (type !== 'notify') return;
 
