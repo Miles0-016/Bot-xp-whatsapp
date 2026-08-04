@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (Traçabilité & Logs Exhaustifs)
+ * bot.js - Bot WhatsApp XP avec Baileys (Traçabilité & Shield Anti-Crash)
  */
 
 // =========================================================================
@@ -115,6 +115,8 @@ else {
 }
 
 function queryWithTimeout(text, params) {
+  if (!pool) return Promise.reject(new Error('Pool PostgreSQL non initialisé'));
+
   const short = text.replace(/\s+/g, ' ').trim().slice(0, 140);
   logger.info({ query: short, params }, '📥 [DB SQL EXEC] Exécution requête SQL');
   
@@ -185,7 +187,7 @@ function startKeepAlive(intervalMs = 5 * 60 * 1000) {
 // 6. PERMISSIONS ET UTILITAIRES DE NUMÉRO
 // =========================================================================
 function numberFromJid(jid) {
-  if (!jid) return '';
+  if (!jid || typeof jid !== 'string') return '';
   return jid.split('@')[0].split(':')[0].replace(/\D/g, '').trim();
 }
 
@@ -252,6 +254,8 @@ async function startSock() {
     browser: Browsers.macOS('Desktop'),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
+    // 🔹 FIX CRITIQUE: Force la ré-authentification si une clé de session est corrompue/manquante
+    badSessionTokenWithNoRetry: false,
     appStateMacVerification: {
       patch: false,
       snapshot: false,
@@ -412,9 +416,12 @@ setInterval(() => {
 // 9. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
-  if (!msg.message || msg.message.protocolMessage) return;
+  // 🔹 FIX CRITIQUE: Filtrer les messages système, les ratés de déchiffrement et les stubs
+  if (!msg || !msg.message || msg.message.protocolMessage || msg.messageStubType) return;
 
-  const from = msg.key.remoteJid;
+  const from = msg.key?.remoteJid;
+  if (!from) return;
+
   const author = msg.key.participant || from;
   const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
 
@@ -450,6 +457,8 @@ async function handleIncomingMessage(sockInstance, msg) {
     if (!pool) return;
 
     const authorNumber = numberFromJid(author);
+    if (!authorNumber) return;
+
     const key = `${from}|${authorNumber}`;
     const newCount = (pendingXP.get(key) || 0) + XP_PER_MESSAGE;
     pendingXP.set(key, newCount);
@@ -473,8 +482,12 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
   logger.info({ command, senderNumber, chatJid, args }, '🚀 [EXECUTION COMMANDE] Début du traitement');
 
   const reply = async (text) => {
-    logger.info({ chatJid, reponseText: text.slice(0, 100) }, '📤 [ENVOI MESSAGE] Réponse envoyée sur WhatsApp');
-    await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
+    try {
+      logger.info({ chatJid, reponseText: text.slice(0, 100) }, '📤 [ENVOI MESSAGE] Réponse envoyée sur WhatsApp');
+      await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
+    } catch (err) {
+      logger.error({ err, chatJid }, '❌ [ENVOI ERREUR] Échec d\'envoi du message WhatsApp');
+    }
   };
 
   if (command === '/jid') {
@@ -593,9 +606,15 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         return;
       }
       const targetNumber = await resolveTargetNumber(msg);
+      if (!targetNumber) {
+        await reply('Cible introuvable.');
+        return;
+      }
+
       const delta = command === '/addxp' ? amount : -amount;
       try {
         logger.info({ targetNumber, delta }, '📥 [TRANSFERT XP ADMIN] Envoi de la requête de modification XP');
+        // 🔹 FIX SECURITY: Recalcul correct du niveau en cas de réduction/ajout
         const result = await queryWithTimeout(
           `UPDATE users 
            SET xp = GREATEST(0, xp + $2),
@@ -651,8 +670,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         newUsername = args.join(' ').trim();
       }
 
-      if (!newUsername) {
-        await reply('Veuillez fournir un pseudo valide.');
+      if (!targetNumber || !newUsername) {
+        await reply('Veuillez fournir un pseudo valide et cibler un membre valide.');
         return;
       }
 
@@ -686,6 +705,10 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       }
       try {
         const target = await resolveTargetNumber(msg);
+        if (!target) {
+          await reply('Cible introuvable.');
+          return;
+        }
         const res = await queryWithTimeout(
           'INSERT INTO bot_admins (phone_number, added_by) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING phone_number',
           [target, senderNumber]
@@ -713,6 +736,10 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       }
       try {
         const target = await resolveTargetNumber(msg);
+        if (!target) {
+          await reply('Cible introuvable.');
+          return;
+        }
         const res = await queryWithTimeout('DELETE FROM bot_admins WHERE phone_number = $1 RETURNING phone_number', [target]);
         if (res.rowCount > 0) {
           cachedAdmins.delete(target);
@@ -731,6 +758,10 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     case '/xp': {
       logger.info({ senderNumber }, '📊 [EXECUTION /xp] Consultation de niveau');
       const target = await resolveTargetNumber(msg);
+      if (!target) {
+        await reply('Cible introuvable.');
+        return;
+      }
       try {
         const res = await queryWithTimeout('SELECT * FROM users WHERE phone_number = $1', [target]);
         
