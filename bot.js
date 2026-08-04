@@ -127,7 +127,7 @@ function queryWithTimeout(text, params) {
 }
 
 // =========================================================================
-// 4. CACHES MÉMOIRE
+// 4. CACHES MÉMOIRE (SÉCURISÉS & ATOMIQUES)
 // =========================================================================
 let cachedGroups = new Map();
 let cachedAdmins = new Set();
@@ -137,14 +137,18 @@ async function refreshCaches() {
   logger.info('[CACHE] Rafraîchissement en cours...');
   try {
     const groups = await queryWithTimeout('SELECT group_jid, group_name FROM authorized_groups');
-    cachedGroups = new Map(groups.rows.map(r => [r.group_jid, r.group_name]));
+    const newGroups = new Map(groups.rows.map(r => [r.group_jid, r.group_name]));
     
     const admins = await queryWithTimeout('SELECT phone_number FROM bot_admins');
-    cachedAdmins = new Set(admins.rows.map(r => r.phone_number));
+    const newAdmins = new Set(admins.rows.map(r => r.phone_number));
+
+    // Remplacement atomique : l'ancien cache reste 100% fonctionnel pendant la requête DB
+    cachedGroups = newGroups;
+    cachedAdmins = newAdmins;
     
-    logger.info(`[CACHE] Mise à jour : ${cachedGroups.size} groupes, ${cachedAdmins.size} admins`);
+    logger.info(`[CACHE] Mise à jour réussie : ${cachedGroups.size} groupes, ${cachedAdmins.size} admins`);
   } catch (err) {
-    logger.error({ err }, '[CACHE] Échec lors du rafraîchissement');
+    logger.error({ err }, '[CACHE] Échec du rafraîchissement (anciens caches conservés)');
   }
 }
 setInterval(refreshCaches, 60 * 1000);
@@ -375,7 +379,7 @@ async function flushPendingXP() {
 setInterval(flushPendingXP, 60 * 1000);
 
 // =========================================================================
-// 8.5. ROUTINE DE NETTOYAGE RAM & DE RECONSTITUTION DU CACHE (CHAQUE 5 MIN)
+// 8.5. ROUTINE DE NETTOYAGE RAM SÉCURISÉE (CHAQUE 5 MIN)
 // =========================================================================
 async function clearRamAndResetCache() {
   logger.info('[MEMORY CLEANUP] 🧹 Début de la procédure de purge de la mémoire RAM (5 min)...');
@@ -384,15 +388,11 @@ async function clearRamAndResetCache() {
     await flushPendingXP();
     logger.info('[MEMORY CLEANUP] ✅ Sauvegarde prioritaire de l’XP terminée.');
 
-    // 2. Vidage complet des maps et ensembles temporaires
+    // 2. Vidage uniquement des structures de messages temporaires (PAS les caches de groupes/admins)
     processingMessages.clear();
-    pendingXP.clear();
-    cachedGroups.clear();
-    cachedAdmins.clear();
 
-    // 3. Reconstitution à neuf du cache à partir de Supabase
+    // 3. Reconstitution du cache proprement via remplacement atomique
     await refreshCaches();
-    logger.info('[MEMORY CLEANUP] 🔄 Caches système rechargés à neuf depuis la base de données.');
 
     // 4. Déclenchement du Garbage Collector Node.js si activé (--expose-gc)
     if (global.gc) {
