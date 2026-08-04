@@ -4,7 +4,7 @@
  * - Serveur Express démarré en premier
  * - Logs de connexion ultra-détaillés : QR, connexion, synchronisation, ready
  * - Gestion de session persistante (MultiFileAuthState)
- * - Toute la logique métier inchangée (Supabase, caches, XP batching)
+ * - Toute la logique métier (Supabase, caches, XP batching)
  */
 
 const path = require('path');
@@ -21,7 +21,6 @@ const {
   fetchLatestBaileysVersion,
   Browsers,
 } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
 
 // =========================================================================
 // 1. CONFIGURATION
@@ -166,7 +165,8 @@ async function startSock() {
   const { version } = await fetchLatestBaileysVersion();
   console.log(`[BOOT] Version Baileys: ${version.join('.')}`);
 
-  const sock = makeWASocket({
+  // Correction de la variable globale sock (évite la rédéclaration locale)
+  sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
@@ -202,7 +202,7 @@ async function startSock() {
       console.log(`[CONNEXION] ✅ CONNECTÉ ! Numéro du bot : ${BOT_NUMBER}`);
       console.log(`[CONNEXION] Mémoire utilisée : ${Math.round(process.memoryUsage().rss / 1024 / 1024)} Mo`);
       console.log('[CONNEXION] Synchronisation des messages en cours... (quelques secondes)');
-      // On attend un peu pour que le socket soit stable
+      
       setTimeout(async () => {
         await refreshCaches();
         console.log(`[READY] Bot prêt. ${cachedGroups.size} groupes actifs, ${cachedAdmins.size} admins.`);
@@ -210,7 +210,8 @@ async function startSock() {
     }
 
     if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      // Correction JavaScript pur : suppression du casting TypeScript `as Boom`
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
       console.log(`[DISCONNECTED] Déconnecté, code: ${statusCode}`);
       if (statusCode !== DisconnectReason.loggedOut) {
         console.log('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
@@ -267,7 +268,7 @@ setInterval(flushPendingXP, 60 * 1000);
 // =========================================================================
 // 8. TRAITEMENT DES MESSAGES
 // =========================================================================
-async function handleIncomingMessage(sock, msg) {
+async function handleIncomingMessage(sockInstance, msg) {
   const from = msg.key.remoteJid;
   const author = msg.key.participant || from;
   const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
@@ -296,7 +297,7 @@ async function handleIncomingMessage(sock, msg) {
   }
 
   if (body.startsWith('/')) {
-    await handleCommand(sock, msg, from, body);
+    await handleCommand(sockInstance, msg, from, body);
     return;
   }
 
@@ -315,7 +316,7 @@ async function handleIncomingMessage(sock, msg) {
 // =========================================================================
 // 9. COMMANDES
 // =========================================================================
-async function handleCommand(sock, msg, chatJid, body) {
+async function handleCommand(sockInstance, msg, chatJid, body) {
   const [raw, ...args] = body.split(/\s+/);
   const command = raw.toLowerCase();
   const sender = msg.key.participant || msg.key.remoteJid;
@@ -324,7 +325,7 @@ async function handleCommand(sock, msg, chatJid, body) {
   console.log(`[CMD] ${command} de ${senderNumber}`);
 
   const reply = async (text) => {
-    await sock.sendMessage(chatJid, { text }, { quoted: msg });
+    await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
   };
 
   if (command === '/jid') {
@@ -513,8 +514,7 @@ async function handleCommand(sock, msg, chatJid, body) {
 // 10. DÉMARRAGE
 // =========================================================================
 console.log('[BOOT] Démarrage du bot avec Baileys...');
-startSock().then(s => {
-  sock = s;
+startSock().then(() => {
   console.log('[BOOT] Socket Baileys initialisé.');
 }).catch(err => {
   console.error('[BOOT] Erreur lors du démarrage de Baileys:', err);
