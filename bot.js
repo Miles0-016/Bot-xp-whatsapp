@@ -142,13 +142,17 @@ setInterval(refreshCaches, 60 * 1000);
 // 5. PERMISSIONS
 // =========================================================================
 function numberFromJid(jid) {
-  return (jid || '').split('@')[0];
+  if (!jid) return '';
+  // Nettoie strictement le JID pour ne garder que le numéro pur (sans :55 ou @g.us/@s.whatsapp.net)
+  return jid.split('@')[0].split(':')[0].trim();
 }
+
 function senderNumberFromMsg(msg) {
   const fromMe = msg.key.fromMe;
   if (fromMe) return BOT_NUMBER || numberFromJid(msg.key.remoteJid);
   return numberFromJid(msg.key.participant || msg.key.remoteJid);
 }
+
 function isSuperAdminNumber(n) { return SUPER_ADMIN_NUMBERS.includes(n); }
 function isBotAdmin(n) { return isSuperAdminNumber(n) || cachedAdmins.has(n); }
 
@@ -177,10 +181,11 @@ async function startSock() {
     auth: state,
     printQRInTerminal: false,
     browser: Browsers.macOS('Desktop'),
-    logger: pino({ level: 'info', transport: { target: 'pino-pretty' } }),
+    logger: pino({ level: 'silent' }),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
     shouldSyncHistoryMessage: () => false,
+    syncFullHistory: false,
   });
 
   // Événement : connexion
@@ -207,7 +212,6 @@ async function startSock() {
       BOT_NUMBER = sock.user?.id ? numberFromJid(sock.user.id) : null;
       console.log(`[CONNEXION] ✅ CONNECTÉ ! Numéro du bot : ${BOT_NUMBER}`);
       console.log(`[CONNEXION] Mémoire utilisée : ${Math.round(process.memoryUsage().rss / 1024 / 1024)} Mo`);
-      console.log('[CONNEXION] Synchronisation des messages en cours... (quelques secondes)');
       
       setTimeout(async () => {
         await refreshCaches();
@@ -218,11 +222,18 @@ async function startSock() {
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       console.log(`[DISCONNECTED] Déconnecté, code: ${statusCode}`);
-      if (statusCode !== DisconnectReason.loggedOut) {
+      
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
+
+      if (isRestartRequired) {
+        console.log('[RECONNECT] Redémarrage requis suite à la configuration (Code 515)... Reconnexion immédiate.');
+        setTimeout(startSock, 1000);
+      } else if (shouldReconnect) {
         console.log('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
         setTimeout(startSock, 5000);
       } else {
-        console.log('[RECONNECT] Déconnecté volontairement, arrêt.');
+        console.log('[RECONNECT] Déconnecté volontairement ou session fermée.');
       }
     }
   });
@@ -232,8 +243,13 @@ async function startSock() {
 
   // Événement : messages reçus
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
     for (const msg of messages) {
-      await handleIncomingMessage(sock, msg);
+      try {
+        await handleIncomingMessage(sock, msg);
+      } catch (err) {
+        console.error('[MSG ERROR] Erreur lors du traitement du message:', err.message);
+      }
     }
   });
 
@@ -274,9 +290,15 @@ setInterval(flushPendingXP, 60 * 1000);
 // 8. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
+  // Ignorer messages système / protocoles vides
+  if (!msg.message || msg.message.protocolMessage) return;
+
   const from = msg.key.remoteJid;
   const author = msg.key.participant || from;
   const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+
+  if (!body.trim()) return;
+
   console.log(`[RAW MSG] from=${from} | author=${author} | body="${body.slice(0, 60)}"`);
 
   // Déduplication
@@ -349,14 +371,18 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       await reply(`ID groupe : ${chatJid}`);
       break;
 
-    case '/activer-groupe':
-      if (!BOT_NUMBER || senderNumber !== BOT_NUMBER) {
-        console.log(`[ACCÈS REFUSÉ] ${senderNumber} a tenté /activer-groupe (BOT=${BOT_NUMBER})`);
-        await reply('Seul le numéro du bot peut activer un groupe.');
+    case '/activer-groupe': {
+      const isBot = BOT_NUMBER && senderNumber === BOT_NUMBER;
+      const isSuper = isSuperAdminNumber(senderNumber);
+
+      console.log(`[CHECK ACTIVER] Sender: "${senderNumber}" | Bot: "${BOT_NUMBER}" | IsSuper: ${isSuper}`);
+
+      if (!isBot && !isSuper) {
+        await reply(`Accès refusé. Seul le bot (${BOT_NUMBER}) ou un Super Admin peut activer le groupe.`);
         return;
       }
       if (cachedGroups.has(chatJid)) {
-        await reply('Déjà activé.');
+        await reply('Groupe déjà activé.');
         return;
       }
       if (cachedGroups.size >= MAX_GROUPS) {
@@ -370,28 +396,32 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
           [chatJid, null, senderNumber]
         );
         cachedGroups.set(chatJid, null);
-        await reply(`Groupe activé (${cachedGroups.size}/${MAX_GROUPS}).`);
+        await reply(`✅ Groupe activé (${cachedGroups.size}/${MAX_GROUPS}).`);
       } catch (err) {
         console.error('[DB ERROR] /activer-groupe:', err.message);
         await reply('Erreur DB.');
       }
       break;
+    }
 
-    case '/desactiver-groupe':
-      if (!BOT_NUMBER || senderNumber !== BOT_NUMBER) {
-        console.log(`[ACCÈS REFUSÉ] ${senderNumber} a tenté /desactiver-groupe`);
-        await reply('Seul le numéro du bot peut désactiver.');
+    case '/desactiver-groupe': {
+      const isBot = BOT_NUMBER && senderNumber === BOT_NUMBER;
+      const isSuper = isSuperAdminNumber(senderNumber);
+
+      if (!isBot && !isSuper) {
+        await reply('Accès refusé.');
         return;
       }
       try {
         await queryWithTimeout('DELETE FROM authorized_groups WHERE group_jid = $1', [chatJid]);
         cachedGroups.delete(chatJid);
-        await reply('Groupe désactivé.');
+        await reply('🔴 Groupe désactivé.');
       } catch (err) {
         console.error('[DB ERROR] /desactiver-groupe:', err.message);
         await reply('Erreur DB.');
       }
       break;
+    }
 
     case '/addxp':
     case '/removexp': {
