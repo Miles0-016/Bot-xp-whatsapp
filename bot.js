@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (Stabilisé & Optimisé)
+ * bot.js - Bot WhatsApp XP avec Baileys (Stabilisation & Auto-Purge)
  */
 
 // =========================================================================
@@ -203,7 +203,7 @@ async function resolveTargetNumber(msg) {
 }
 
 // =========================================================================
-// 7. SOCKET WHATSAPP (BAILEYS - CORRIGÉ CORRUPTION SESSION & SYNCHRO)
+// 7. SOCKET WHATSAPP (PURGE FORCÉE & DESACTIVATION SYNCHRO)
 // =========================================================================
 let sock = null;
 let processingMessages = new Set();
@@ -221,6 +221,17 @@ async function startSock() {
   }
 
   const authDir = path.join(__dirname, '.baileys_auth');
+  
+  // PURGE AUTOMATIQUE DU DOSSIER DE SESSION CORROMPU AU DÉMARRAGE
+  if (fs.existsSync(authDir)) {
+    try {
+      logger.info('[BOOT] Nettoyage forcé de l’ancienne session corrompue...');
+      fs.rmSync(authDir, { recursive: true, force: true });
+    } catch (e) {
+      logger.error({ err: e }, '[BOOT] Impossible de supprimer .baileys_auth');
+    }
+  }
+
   logger.info('[BOOT] Initialisation du socket Baileys...');
   
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -235,12 +246,10 @@ async function startSock() {
     browser: Browsers.macOS('Desktop'),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
-    // Annule la verification Mac/AppState qui cause l'erreur "tried remove, but no previous op"
     appStateMacVerification: {
       patch: false,
       snapshot: false,
     },
-    // Empêche la récupération de l'historique WhatsApp au démarrage
     shouldSyncHistoryMessage: () => false,
     syncFullHistory: false,
     fireInitQueries: false,
@@ -299,13 +308,7 @@ async function startSock() {
         logger.info('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
         setTimeout(() => startSock(), 5000);
       } else {
-        logger.error('[RECONNECT] Session fermée de manière définitive (Déconnecté). Nettoyage de la session...');
-        try {
-          fs.rmSync(authDir, { recursive: true, force: true });
-          logger.info('[RECONNECT] Dossier .baileys_auth supprimé avec succès.');
-        } catch (e) {
-          logger.error({ err: e }, '[RECONNECT] Échec de la suppression du dossier auth');
-        }
+        logger.error('[RECONNECT] Session déconnectée.');
         setTimeout(() => startSock(), 5000);
       }
     }
@@ -363,7 +366,6 @@ async function flushPendingXP() {
 }
 setInterval(flushPendingXP, 60 * 1000);
 
-// Purge légère des IDs de messages
 setInterval(() => {
   if (processingMessages.size > 2000) {
     processingMessages.clear();
@@ -628,7 +630,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 
     case '/remove-admin':
       if (!isSuperAdminNumber(senderNumber)) {
-        await reply('Seul un Super Admin me permet de faire cela.');
+        await reply('Seul un Super Admin peut faire cela.');
         return;
       }
       try {
