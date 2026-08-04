@@ -469,6 +469,55 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       break;
     }
 
+    case '/sign':
+    case '/register': {
+      if (args.length === 0) {
+        await reply('Utilisation : /sign <pseudo> [@membre]\nExemple : /sign Président @membre');
+        return;
+      }
+
+      const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
+      const hasMention = contextInfo && contextInfo.mentionedJid && contextInfo.mentionedJid.length > 0;
+
+      let targetNumber;
+      let newUsername;
+
+      if (hasMention) {
+        if (!isBotAdmin(senderNumber)) {
+          await reply('Seul un Admin du bot peut inscrire un autre membre.');
+          return;
+        }
+        targetNumber = numberFromJid(contextInfo.mentionedJid[0]);
+        newUsername = args.filter(a => !a.startsWith('@')).join(' ').trim();
+      } else {
+        targetNumber = senderNumber;
+        newUsername = args.join(' ').trim();
+      }
+
+      if (!newUsername) {
+        await reply('Veuillez fournir un pseudo valide.');
+        return;
+      }
+
+      try {
+        const result = await queryWithTimeout(
+          `INSERT INTO users (phone_number, username, xp, level)
+           VALUES ($1, $2, 0, 1)
+           ON CONFLICT (phone_number) 
+           DO UPDATE SET username = EXCLUDED.username
+           RETURNING *`,
+          [targetNumber, newUsername]
+        );
+
+        const member = result.rows[0];
+        await reply(`✅ Enregistrement réussi !\n👤 **Membre** : @${member.phone_number}\n🏷️ **Pseudo** : ${member.username}\n✨ **XP** : ${member.xp} | **Niveau** : ${member.level}`);
+      } catch (err) {
+        console.error('[DB ERROR] /sign:', err.message);
+        await reply('Erreur lors de l’inscription en BDD.');
+      }
+      break;
+    }
+
     case '/add-admin':
       if (!isSuperAdminNumber(senderNumber)) {
         await reply('Seul un Super Admin peut faire cela.');
@@ -517,7 +566,6 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       try {
         let res = await queryWithTimeout('SELECT * FROM users WHERE phone_number = $1', [target]);
         
-        // Auto-création si l'utilisateur n'existe pas encore en DB
         if (res.rows.length === 0) {
           res = await queryWithTimeout(
             `INSERT INTO users (phone_number, username, xp, level)
