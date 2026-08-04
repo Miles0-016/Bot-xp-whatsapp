@@ -1,10 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (léger, sans Puppeteer)
- * 
- * - Serveur Express démarré en premier
- * - Logs de connexion ultra-détaillés : QR, connexion, synchronisation, ready
- * - Gestion de session persistante (MultiFileAuthState)
- * - Toute la logique métier (Supabase, caches, XP batching avec UPSERT automatique)
+ * bot.js - Bot WhatsApp XP avec Baileys (Version Keep-Alive 5 min & ultra-stabilisée)
  */
 
 // =========================================================================
@@ -30,8 +25,13 @@ const {
 } = require('@whiskeysockets/baileys');
 
 // =========================================================================
-// 1. CONFIGURATION
+// 1. CONFIGURATION & LOGGER VERBOSE
 // =========================================================================
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  serializers: { err: pino.stdSerializers.err }
+});
+
 const MAX_GROUPS = 5;
 const XP_PER_MESSAGE = 1;
 const MEDALS = ['🥇', '🥈', '🥉'];
@@ -40,13 +40,18 @@ const SUPER_ADMIN_NUMBERS = (process.env.SUPER_ADMIN_NUMBERS || '')
   .split(',')
   .map(n => n.trim())
   .filter(Boolean);
-if (SUPER_ADMIN_NUMBERS.length === 0) console.warn('⚠️ SUPER_ADMIN_NUMBERS vide');
+if (SUPER_ADMIN_NUMBERS.length === 0) logger.warn('⚠️ SUPER_ADMIN_NUMBERS vide');
 
 let currentQRCodeBase64 = null;
-let BOT_NUMBER = null; // sera rempli après la connexion
+let BOT_NUMBER = null;
+let keepAliveTimer = null; // Timer du ping réveil
+
+// Anti-crash global
+process.on('uncaughtException', err => logger.error({ err }, '[CRITICAL] Uncaught Exception'));
+process.on('unhandledRejection', reason => logger.error({ reason }, '[CRITICAL] Unhandled Rejection'));
 
 // =========================================================================
-// 2. SERVEUR EXPRESS (démarré immédiatement)
+// 2. SERVEUR EXPRESS
 // =========================================================================
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -79,8 +84,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`[HTTP] Serveur Express démarré sur le port ${PORT} (avant l'initialisation du bot)`);
+app.listen(PORT, () => {
+  logger.info(`[HTTP] Serveur Express démarré sur le port ${PORT}`);
 });
 
 // =========================================================================
@@ -97,22 +102,25 @@ const pool = process.env.DATABASE_URL
       query_timeout: 5000,
     })
   : null;
-if (!pool) console.error('❌ DATABASE_URL absente');
-else pool.on('error', err => console.error('[DB POOL ERROR]', err.message));
+
+if (!pool) logger.error('❌ DATABASE_URL absente');
+else pool.on('error', err => logger.error({ err }, '[DB POOL ERROR]'));
 
 function queryWithTimeout(text, params) {
   const short = text.replace(/\s+/g, ' ').trim().slice(0, 140);
-  console.log(`[DB QUERY] ${short}${params ? ' | params='+JSON.stringify(params) : ''}`);
+  logger.debug(`[DB QUERY] ${short} ${params ? '| params=' + JSON.stringify(params) : ''}`);
+  
   const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('Timeout Supabase (6s)')), 6000)
+    setTimeout(() => reject(new Error('Timeout Supabase (5s)')), 5000)
   );
+  
   return Promise.race([pool.query(text, params), timeout])
     .then(result => {
-      console.log(`[DB QUERY OK] -> ${result.rowCount ?? result.rows?.length ?? 0} ligne(s)`);
+      logger.debug(`[DB OK] -> ${result.rowCount ?? result.rows?.length ?? 0} ligne(s)`);
       return result;
     })
     .catch(err => {
-      console.error(`[DB ERROR] ${short} :`, err.stack || err.message);
+      logger.error({ err, query: short }, '[DB ERROR]');
       throw err;
     });
 }
@@ -125,25 +133,59 @@ let cachedAdmins = new Set();
 
 async function refreshCaches() {
   if (!pool) return;
-  console.log('[CACHE] Rafraîchissement...');
+  logger.info('[CACHE] Rafraîchissement en cours...');
   try {
     const groups = await queryWithTimeout('SELECT group_jid, group_name FROM authorized_groups');
     cachedGroups = new Map(groups.rows.map(r => [r.group_jid, r.group_name]));
+    
     const admins = await queryWithTimeout('SELECT phone_number FROM bot_admins');
     cachedAdmins = new Set(admins.rows.map(r => r.phone_number));
-    console.log(`[CACHE] ${cachedGroups.size} groupes, ${cachedAdmins.size} admins`);
+    
+    logger.info(`[CACHE] Mise à jour : ${cachedGroups.size} groupes, ${cachedAdmins.size} admins`);
   } catch (err) {
-    console.error('[CACHE] Erreur:', err.message);
+    logger.error({ err }, '[CACHE] Échec lors du rafraîchissement');
   }
 }
 setInterval(refreshCaches, 60 * 1000);
 
 // =========================================================================
-// 5. PERMISSIONS ET UTILITAIRES DE NUMÉRO
+// 5. FONCTION KEEP-ALIVE (SIMULATION D'OPÉRATION TOUTES LES 5 MIN)
+// =========================================================================
+function startKeepAlive(intervalMs = 5 * 60 * 1000) {
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+
+  keepAliveTimer = setInterval(async () => {
+    logger.info('[KEEP-ALIVE] ⏰ Exécution de l’opération de réveil (Ping 5min)...');
+
+    // 1. Ping du WebSocket WhatsApp (maintien le flux socket actif)
+    if (sock && sock.ws && sock.ws.isOpen) {
+      try {
+        sock.ws.ping();
+        logger.info('[KEEP-ALIVE] 🟢 Ping WebSocket envoyé avec succès à WhatsApp.');
+      } catch (err) {
+        logger.error({ err }, '[KEEP-ALIVE] 🔴 Échec de l’envoi du ping WebSocket.');
+      }
+    } else {
+      logger.warn('[KEEP-ALIVE] ⚠️ Socket non prêt pour le ping WebSocket.');
+    }
+
+    // 2. Ping silencieux de la base de données Supabase (maintien le pool actif)
+    if (pool) {
+      try {
+        await queryWithTimeout('SELECT 1');
+        logger.info('[KEEP-ALIVE] 🟢 Ping Base de Données réussi.');
+      } catch (err) {
+        logger.error({ err }, '[KEEP-ALIVE] 🔴 Échec du ping Base de Données.');
+      }
+    }
+  }, intervalMs);
+}
+
+// =========================================================================
+// 6. PERMISSIONS ET UTILITAIRES DE NUMÉRO
 // =========================================================================
 function numberFromJid(jid) {
   if (!jid) return '';
-  // Nettoie strictement le JID pour ne garder que le numéro pur (sans :55 ou @g.us/@s.whatsapp.net)
   return jid.split('@')[0].split(':')[0].replace(/\D/g, '').trim();
 }
 
@@ -172,90 +214,97 @@ async function resolveTargetNumber(msg) {
 }
 
 // =========================================================================
-// 6. SOCKET WHATSAPP (BAILEYS)
+// 7. SOCKET WHATSAPP (BAILEYS AVEC LOGS ACTIFS)
 // =========================================================================
 let sock = null;
 let processingMessages = new Set();
+let isReconnecting = false;
 
 async function startSock() {
-  console.log('[BOOT] Initialisation du socket Baileys...');
+  if (isReconnecting) return;
+  isReconnecting = true;
+
+  logger.info('[BOOT] Initialisation du socket Baileys...');
   const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, '.baileys_auth'));
   const { version } = await fetchLatestBaileysVersion();
-  console.log(`[BOOT] Version Baileys: ${version.join('.')}`);
+  logger.info(`[BOOT] Version Baileys: ${version.join('.')}`);
 
   sock = makeWASocket({
     version,
     auth: state,
+    logger,
     printQRInTerminal: false,
     browser: Browsers.macOS('Desktop'),
-    logger: pino({ level: 'silent' }),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
     shouldSyncHistoryMessage: () => false,
     syncFullHistory: false,
+    keepAliveIntervalMs: 25000,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
   });
 
-  // Événement : connexion
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
     if (qr) {
-      console.log('[QR] 📱 Nouveau QR code généré (en attente de scan)');
+      logger.info('[QR] 📱 Nouveau QR code généré.');
       try {
         currentQRCodeBase64 = await QRCode.toDataURL(qr);
-        console.log('[QR] QR code disponible sur la page web /');
       } catch (err) {
-        console.error('[QR] Erreur génération image:', err.message);
+        logger.error({ err }, '[QR] Erreur conversion base64');
         currentQRCodeBase64 = null;
       }
     }
 
     if (connection === 'connecting') {
-      console.log('[CONNEXION] 🔄 Connexion en cours... (établissement du WebSocket)');
+      logger.info('[CONNEXION] 🔄 Connexion aux serveurs WhatsApp...');
     }
 
     if (connection === 'open') {
+      isReconnecting = false;
       currentQRCodeBase64 = null;
       BOT_NUMBER = sock.user?.id ? numberFromJid(sock.user.id) : null;
-      console.log(`[CONNEXION] ✅ CONNECTÉ ! Numéro du bot : ${BOT_NUMBER}`);
-      console.log(`[CONNEXION] Mémoire utilisée : ${Math.round(process.memoryUsage().rss / 1024 / 1024)} Mo`);
+      logger.info(`[CONNEXION] ✅ CONNECTÉ ! Numéro Bot : ${BOT_NUMBER}`);
       
+      // Démarrage de la routine de réveil (Keep-Alive) toutes les 5 minutes
+      startKeepAlive(5 * 60 * 1000);
+
       setTimeout(async () => {
         await refreshCaches();
-        console.log(`[READY] Bot prêt. ${cachedGroups.size} groupes actifs, ${cachedAdmins.size} admins.`);
+        logger.info(`[READY] Bot opérationnel. ${cachedGroups.size} groupes, ${cachedAdmins.size} admins.`);
       }, 2000);
     }
 
     if (connection === 'close') {
+      isReconnecting = false;
+      if (keepAliveTimer) clearInterval(keepAliveTimer); // Stopper la boucle si déconnecté
+
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.log(`[DISCONNECTED] Déconnecté, code: ${statusCode}`);
+      logger.warn({ statusCode, err: lastDisconnect?.error }, '[DISCONNECTED] Connexion fermée.');
       
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
 
-      if (isRestartRequired) {
-        console.log('[RECONNECT] Redémarrage requis suite à la configuration (Code 515)... Reconnexion immédiate.');
-        setTimeout(startSock, 1000);
-      } else if (shouldReconnect) {
-        console.log('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
-        setTimeout(startSock, 5000);
+      if (shouldReconnect) {
+        logger.info('[RECONNECT] Tentative de reconnexion dans 3 secondes...');
+        setTimeout(() => startSock(), 3000);
       } else {
-        console.log('[RECONNECT] Déconnecté volontairement ou session fermée.');
+        logger.error('[RECONNECT] Session fermée de manière définitive (Déconnecté).');
       }
     }
   });
 
-  // Événement : sauvegarde des creds
   sock.ev.on('creds.update', saveCreds);
 
-  // Événement : messages reçus
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    logger.debug({ type, count: messages.length }, '[UPSERT] Réception de paquets messages');
     if (type !== 'notify') return;
+
     for (const msg of messages) {
       try {
         await handleIncomingMessage(sock, msg);
       } catch (err) {
-        console.error('[MSG ERROR] Erreur lors du traitement du message:', err.message);
+        logger.error({ err }, '[MSG ERROR] Erreur lors du traitement du message');
       }
     }
   });
@@ -264,7 +313,7 @@ async function startSock() {
 }
 
 // =========================================================================
-// 7. XP BATCHING (AVEC AUTOMATIC USER CREATION / UPSERT)
+// 8. XP BATCHING
 // =========================================================================
 let pendingXP = new Map();
 
@@ -272,12 +321,12 @@ async function flushPendingXP() {
   if (!pool || pendingXP.size === 0) return;
   const batch = pendingXP;
   pendingXP = new Map();
-  console.log(`[XP FLUSH] ${batch.size} entrées`);
+  logger.info(`[XP FLUSH] Sauvegarde de ${batch.size} entités XP...`);
+  
   for (const [key, count] of batch) {
     const [groupJid, phoneNumber] = key.split('|');
     if (!phoneNumber) continue;
     try {
-      // UPSERT: Crée automatiquement le membre en DB s'il n'existe pas encore !
       const res = await queryWithTimeout(
         `INSERT INTO users (phone_number, username, xp, level)
          VALUES ($1, $2, $3, floor($3/500)+1)
@@ -288,9 +337,9 @@ async function flushPendingXP() {
          RETURNING xp, level`,
         [phoneNumber, phoneNumber, count]
       );
-      console.log(`[XP SAVE] +${count} pour ${phoneNumber} (total ${res.rows[0].xp} XP)`);
+      logger.debug(`[XP SAVE] +${count} XP -> ${phoneNumber} (Total: ${res.rows[0].xp})`);
     } catch (err) {
-      console.error(`[XP ERROR] ${phoneNumber}:`, err.message);
+      logger.error({ err, phoneNumber }, '[XP ERROR] Échec insertion batch');
       pendingXP.set(key, (pendingXP.get(key) || 0) + count);
     }
   }
@@ -298,74 +347,70 @@ async function flushPendingXP() {
 setInterval(flushPendingXP, 60 * 1000);
 
 // =========================================================================
-// 8. TRAITEMENT DES MESSAGES
+// 9. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
   if (!msg.message || msg.message.protocolMessage) return;
 
   const from = msg.key.remoteJid;
   const author = msg.key.participant || from;
-  const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+  const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
 
   if (!body.trim()) return;
 
-  console.log(`[RAW MSG] from=${from} | author=${author} | body="${body.slice(0, 60)}"`);
-
-  // Déduplication
   const msgId = msg.key.id;
+
   if (msgId && processingMessages.has(msgId)) {
-    console.log('[DEDUP] Message déjà traité, ignoré');
+    logger.warn({ msgId }, '[WORKER] Message déjà en cours de traitement, ignoré.');
     return;
   }
+  
   if (msgId) processingMessages.add(msgId);
-  if (processingMessages.size > 10000) {
-    const toDelete = [...processingMessages].slice(0, 5000);
-    toDelete.forEach(id => processingMessages.delete(id));
-  }
 
-  if (!from.endsWith('@g.us')) {
-    console.log('[SKIP] Pas un groupe');
-    return;
-  }
+  const msgTimeout = setTimeout(() => {
+    if (msgId && processingMessages.has(msgId)) {
+      processingMessages.delete(msgId);
+      logger.warn({ msgId }, '[WORKER] Timeout de sécurité libéré pour le message');
+    }
+  }, 10000);
 
-  if (msg.key.fromMe && !body.startsWith('/')) {
-    console.log('[SKIP] Message du bot non-commande');
-    return;
-  }
+  try {
+    if (!from.endsWith('@g.us')) return;
+    if (msg.key.fromMe && !body.startsWith('/')) return;
 
-  if (body.startsWith('/')) {
-    await handleCommand(sockInstance, msg, from, body);
-    return;
-  }
+    if (body.startsWith('/')) {
+      logger.info({ from, author, body }, '[CMD INTERCEPT]');
+      await handleCommand(sockInstance, msg, from, body);
+      return;
+    }
 
-  if (!cachedGroups.has(from)) {
-    console.log(`[SKIP] Groupe ${from} non activé`);
-    return;
-  }
-  if (!pool) return;
+    if (!cachedGroups.has(from)) return;
+    if (!pool) return;
 
-  const authorNumber = numberFromJid(author);
-  const key = `${from}|${authorNumber}`;
-  pendingXP.set(key, (pendingXP.get(key) || 0) + XP_PER_MESSAGE);
-  console.log(`[XP QUEUE] +1 pour ${authorNumber} (attente: ${pendingXP.get(key)})`);
+    const authorNumber = numberFromJid(author);
+    const key = `${from}|${authorNumber}`;
+    pendingXP.set(key, (pendingXP.get(key) || 0) + XP_PER_MESSAGE);
+  } finally {
+    clearTimeout(msgTimeout);
+    if (msgId) processingMessages.delete(msgId);
+  }
 }
 
 // =========================================================================
-// 9. COMMANDES
+// 10. COMMANDES
 // =========================================================================
 async function handleCommand(sockInstance, msg, chatJid, body) {
   const [raw, ...args] = body.split(/\s+/);
   const command = raw.toLowerCase();
   
   const senderNumber = senderNumberFromMsg(msg);
-  console.log(`[CMD] ${command} de ${senderNumber} (fromMe=${msg.key.fromMe})`);
+  logger.info({ command, senderNumber, chatJid }, '[CMD EXEC]');
 
   const reply = async (text) => {
     await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
   };
 
   if (command === '/jid') {
-    console.log(`[JID CMD] ${chatJid}`);
     await reply(`L'ID de ce chat est :\n\`${chatJid}\``);
     return;
   }
@@ -376,6 +421,31 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
   }
 
   switch (command) {
+    case '/menu': {
+      const helpText = `📜 *MENU DU BOT*
+
+👤 *MEMBRES & STATS*
+🔹 */xp [@membre]* : Affiche le niveau/XP.
+🔹 */sign <pseudo> [@membre]* : S'inscrire ou inscrire un membre.
+🔹 */top* (ou */leaderboard*) : TOP 20 des membres les plus actifs.
+
+🛠️ *ADMINISTRATEURS BOT*
+🔸 */addxp @membre <montant>* : Ajouter de l'XP.
+🔸 */removexp @membre <montant>* : Retirer de l'XP.
+
+🔑 *SUPER ADMINS*
+⚡ */activer-groupe* : Activer le système d'XP.
+⚡ */desactiver-groupe* : Désactiver le système d'XP.
+⚡ */add-admin @membre* : Ajouter un Admin Bot.
+⚡ */remove-admin @membre* : Retirer un Admin Bot.
+
+🔍 *UTILITAIRES*
+ℹ️ */id* ou */jid* : Afficher l'identifiant du groupe.`;
+
+      await reply(helpText);
+      break;
+    }
+
     case '/id':
       await reply(`ID groupe : ${chatJid}`);
       break;
@@ -383,8 +453,6 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     case '/activer-groupe': {
       const isBot = BOT_NUMBER && senderNumber === BOT_NUMBER;
       const isSuper = isSuperAdminNumber(senderNumber);
-
-      console.log(`[CHECK ACTIVER] Sender: "${senderNumber}" | Bot: "${BOT_NUMBER}" | IsSuper: ${isSuper}`);
 
       if (!isBot && !isSuper) {
         await reply(`Accès refusé. Seul le bot (${BOT_NUMBER}) ou un Super Admin peut activer le groupe.`);
@@ -407,7 +475,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         cachedGroups.set(chatJid, null);
         await reply(`✅ Groupe activé (${cachedGroups.size}/${MAX_GROUPS}).`);
       } catch (err) {
-        console.error('[DB ERROR] /activer-groupe:', err.message);
+        logger.error({ err }, '[DB ERROR] /activer-groupe');
         await reply(`Erreur DB: ${err.message}`);
       }
       break;
@@ -426,7 +494,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         cachedGroups.delete(chatJid);
         await reply('🔴 Groupe désactivé.');
       } catch (err) {
-        console.error('[DB ERROR] /desactiver-groupe:', err.message);
+        logger.error({ err }, '[DB ERROR] /desactiver-groupe');
         await reply('Erreur DB.');
       }
       break;
@@ -435,7 +503,6 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     case '/addxp':
     case '/removexp': {
       if (!isBotAdmin(senderNumber)) {
-        console.log(`[DENIED] ${senderNumber} non admin`);
         await reply('Non autorisé.');
         return;
       }
@@ -463,7 +530,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
           `L'admin vient de ${verb} ${amount} XP à @${targetNumber} (total: ${member.xp} XP)`
         );
       } catch (err) {
-        console.error(`[DB ERROR] ${command}:`, err.message);
+        logger.error({ err }, `[DB ERROR] ${command}`);
         await reply('Erreur DB.');
       }
       break;
@@ -512,7 +579,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         const member = result.rows[0];
         await reply(`✅ Enregistrement réussi !\n👤 **Membre** : @${member.phone_number}\n🏷️ **Pseudo** : ${member.username}\n✨ **XP** : ${member.xp} | **Niveau** : ${member.level}`);
       } catch (err) {
-        console.error('[DB ERROR] /sign:', err.message);
+        logger.error({ err }, '[DB ERROR] /sign');
         await reply('Erreur lors de l’inscription en BDD.');
       }
       break;
@@ -536,7 +603,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
           await reply(`@${target} est déjà admin.`);
         }
       } catch (err) {
-        console.error('[DB ERROR] /add-admin:', err.message);
+        logger.error({ err }, '[DB ERROR] /add-admin');
         await reply('Erreur DB.');
       }
       break;
@@ -556,7 +623,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
           await reply(`@${target} n’était pas admin.`);
         }
       } catch (err) {
-        console.error('[DB ERROR] /remove-admin:', err.message);
+        logger.error({ err }, '[DB ERROR] /remove-admin');
         await reply('Erreur DB.');
       }
       break;
@@ -580,7 +647,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         const displayName = m.username && m.username !== m.phone_number ? m.username : `@${m.phone_number}`;
         await reply(`👤 ${displayName}\n✨ XP : ${m.xp}\n📊 Niveau : ${m.level}`);
       } catch (err) {
-        console.error('[DB ERROR] /xp:', err.message);
+        logger.error({ err }, '[DB ERROR] /xp');
         await reply('Erreur DB lors de la récupération de l’XP.');
       }
       break;
@@ -601,41 +668,33 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         });
         await reply(`🏆 Classement XP 🏆\n\n${lines.join('\n')}`);
       } catch (err) {
-        console.error('[DB ERROR] /top:', err.message);
+        logger.error({ err }, '[DB ERROR] /top');
         await reply('Erreur DB.');
       }
       break;
     }
 
     default:
-      console.log('[CMD] Inconnue:', command);
+      logger.debug({ command }, '[CMD] Inconnue');
   }
 }
 
 // =========================================================================
-// 10. DÉMARRAGE
+// 11. DÉMARRAGE ET ARRÊT PROPRE
 // =========================================================================
-console.log('[BOOT] Démarrage du bot avec Baileys...');
-startSock().then(() => {
-  console.log('[BOOT] Socket Baileys initialisé.');
-}).catch(err => {
-  console.error('[BOOT] Erreur lors du démarrage de Baileys:', err);
-});
-
-// =========================================================================
-// 11. GESTION DES ERREURS ET ARRÊT
-// =========================================================================
-process.on('unhandledRejection', reason => console.error('Unhandled Rejection:', reason));
-process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
+logger.info('[BOOT] Démarrage du bot...');
+startSock().catch(err => logger.error({ err }, '[BOOT ERROR]'));
 
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[SHUTDOWN] ${signal} reçu`);
+  logger.warn(`[SHUTDOWN] Signal ${signal} reçu.`);
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
   await flushPendingXP();
   if (pool) await pool.end();
   process.exit(0);
 }
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
