@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (Version Keep-Alive 5 min & ultra-stabilisée)
+ * bot.js - Bot WhatsApp XP avec Baileys (Inscriptions strictes & Keep-Alive 5 min)
  */
 
 // =========================================================================
@@ -44,7 +44,7 @@ if (SUPER_ADMIN_NUMBERS.length === 0) logger.warn('⚠️ SUPER_ADMIN_NUMBERS vi
 
 let currentQRCodeBase64 = null;
 let BOT_NUMBER = null;
-let keepAliveTimer = null; // Timer du ping réveil
+let keepAliveTimer = null;
 
 // Anti-crash global
 process.on('uncaughtException', err => logger.error({ err }, '[CRITICAL] Uncaught Exception'));
@@ -149,7 +149,7 @@ async function refreshCaches() {
 setInterval(refreshCaches, 60 * 1000);
 
 // =========================================================================
-// 5. FONCTION KEEP-ALIVE (SIMULATION D'OPÉRATION TOUTES LES 5 MIN)
+// 5. FONCTION KEEP-ALIVE
 // =========================================================================
 function startKeepAlive(intervalMs = 5 * 60 * 1000) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
@@ -157,19 +157,15 @@ function startKeepAlive(intervalMs = 5 * 60 * 1000) {
   keepAliveTimer = setInterval(async () => {
     logger.info('[KEEP-ALIVE] ⏰ Exécution de l’opération de réveil (Ping 5min)...');
 
-    // 1. Ping du WebSocket WhatsApp (maintien le flux socket actif)
     if (sock && sock.ws && sock.ws.isOpen) {
       try {
         sock.ws.ping();
         logger.info('[KEEP-ALIVE] 🟢 Ping WebSocket envoyé avec succès à WhatsApp.');
       } catch (err) {
-        logger.error({ err }, '[KEEP-ALIVE] 🔴 Échec de l’envoi du ping WebSocket.');
+        logger.error({ err }, '[KEEP-ALIVE] 🔴 Échec du ping WebSocket.');
       }
-    } else {
-      logger.warn('[KEEP-ALIVE] ⚠️ Socket non prêt pour le ping WebSocket.');
     }
 
-    // 2. Ping silencieux de la base de données Supabase (maintien le pool actif)
     if (pool) {
       try {
         await queryWithTimeout('SELECT 1');
@@ -214,7 +210,7 @@ async function resolveTargetNumber(msg) {
 }
 
 // =========================================================================
-// 7. SOCKET WHATSAPP (BAILEYS AVEC LOGS ACTIFS)
+// 7. SOCKET WHATSAPP (BAILEYS)
 // =========================================================================
 let sock = null;
 let processingMessages = new Set();
@@ -267,7 +263,6 @@ async function startSock() {
       BOT_NUMBER = sock.user?.id ? numberFromJid(sock.user.id) : null;
       logger.info(`[CONNEXION] ✅ CONNECTÉ ! Numéro Bot : ${BOT_NUMBER}`);
       
-      // Démarrage de la routine de réveil (Keep-Alive) toutes les 5 minutes
       startKeepAlive(5 * 60 * 1000);
 
       setTimeout(async () => {
@@ -278,7 +273,7 @@ async function startSock() {
 
     if (connection === 'close') {
       isReconnecting = false;
-      if (keepAliveTimer) clearInterval(keepAliveTimer); // Stopper la boucle si déconnecté
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       logger.warn({ statusCode, err: lastDisconnect?.error }, '[DISCONNECTED] Connexion fermée.');
@@ -297,7 +292,6 @@ async function startSock() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    logger.debug({ type, count: messages.length }, '[UPSERT] Réception de paquets messages');
     if (type !== 'notify') return;
 
     for (const msg of messages) {
@@ -313,7 +307,7 @@ async function startSock() {
 }
 
 // =========================================================================
-// 8. XP BATCHING
+// 8. XP BATCHING (STRICTEMENT INSCRITS UNIQUEMENT)
 // =========================================================================
 let pendingXP = new Map();
 
@@ -321,26 +315,29 @@ async function flushPendingXP() {
   if (!pool || pendingXP.size === 0) return;
   const batch = pendingXP;
   pendingXP = new Map();
-  logger.info(`[XP FLUSH] Sauvegarde de ${batch.size} entités XP...`);
+  logger.info(`[XP FLUSH] Sauvegarde des points d'XP accumulés...`);
   
   for (const [key, count] of batch) {
     const [groupJid, phoneNumber] = key.split('|');
     if (!phoneNumber) continue;
     try {
+      // UPDATE strict : Seuls les membres déjà enregistrés dans BDD reçoivent l'XP.
       const res = await queryWithTimeout(
-        `INSERT INTO users (phone_number, username, xp, level)
-         VALUES ($1, $2, $3, floor($3/500)+1)
-         ON CONFLICT (phone_number) 
-         DO UPDATE SET 
-            xp = users.xp + EXCLUDED.xp,
-            level = floor((users.xp + EXCLUDED.xp)/500) + 1
-         RETURNING xp, level`,
-        [phoneNumber, phoneNumber, count]
+        `UPDATE users 
+         SET xp = xp + $2,
+             level = floor((xp + $2)/500) + 1
+         WHERE phone_number = $1
+         RETURNING xp, level, username`,
+        [phoneNumber, count]
       );
-      logger.debug(`[XP SAVE] +${count} XP -> ${phoneNumber} (Total: ${res.rows[0].xp})`);
+      
+      if (res.rowCount > 0) {
+        logger.debug(`[XP SAVE] +${count} XP -> ${res.rows[0].username} (Total: ${res.rows[0].xp})`);
+      } else {
+        logger.debug(`[XP IGNORED] Numéro ${phoneNumber} non inscrit, message ignoré.`);
+      }
     } catch (err) {
-      logger.error({ err, phoneNumber }, '[XP ERROR] Échec insertion batch');
-      pendingXP.set(key, (pendingXP.get(key) || 0) + count);
+      logger.error({ err, phoneNumber }, '[XP ERROR] Échec mise à jour XP');
     }
   }
 }
@@ -360,17 +357,12 @@ async function handleIncomingMessage(sockInstance, msg) {
 
   const msgId = msg.key.id;
 
-  if (msgId && processingMessages.has(msgId)) {
-    logger.warn({ msgId }, '[WORKER] Message déjà en cours de traitement, ignoré.');
-    return;
-  }
-  
+  if (msgId && processingMessages.has(msgId)) return;
   if (msgId) processingMessages.add(msgId);
 
   const msgTimeout = setTimeout(() => {
     if (msgId && processingMessages.has(msgId)) {
       processingMessages.delete(msgId);
-      logger.warn({ msgId }, '[WORKER] Timeout de sécurité libéré pour le message');
     }
   }, 10000);
 
@@ -515,19 +507,23 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       const delta = command === '/addxp' ? amount : -amount;
       try {
         const result = await queryWithTimeout(
-          `INSERT INTO users (phone_number, username, xp, level)
-           VALUES ($1, $1, GREATEST(0, $2), floor(GREATEST(0, $2)/500)+1)
-           ON CONFLICT (phone_number) 
-           DO UPDATE SET 
-              xp = GREATEST(0, users.xp + EXCLUDED.xp),
-              level = floor(GREATEST(0, users.xp + EXCLUDED.xp)/500) + 1
+          `UPDATE users 
+           SET xp = GREATEST(0, xp + $2),
+               level = floor(GREATEST(0, xp + $2)/500) + 1
+           WHERE phone_number = $1
            RETURNING *`,
           [targetNumber, delta]
         );
+        
+        if (result.rowCount === 0) {
+          await reply(`⚠️ Ce membre (@${targetNumber}) n'est pas encore inscrit.`);
+          return;
+        }
+
         const member = result.rows[0];
         const verb = command === '/addxp' ? 'ajouté' : 'retiré';
         await reply(
-          `L'admin vient de ${verb} ${amount} XP à @${targetNumber} (total: ${member.xp} XP)`
+          `L'admin vient de ${verb} ${amount} XP à ${member.username} (@${targetNumber}) (total: ${member.xp} XP)`
         );
       } catch (err) {
         logger.error({ err }, `[DB ERROR] ${command}`);
@@ -631,21 +627,15 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     case '/xp': {
       const target = await resolveTargetNumber(msg);
       try {
-        let res = await queryWithTimeout('SELECT * FROM users WHERE phone_number = $1', [target]);
+        const res = await queryWithTimeout('SELECT * FROM users WHERE phone_number = $1', [target]);
         
         if (res.rows.length === 0) {
-          res = await queryWithTimeout(
-            `INSERT INTO users (phone_number, username, xp, level)
-             VALUES ($1, $1, 0, 1)
-             ON CONFLICT (phone_number) DO UPDATE SET phone_number = EXCLUDED.phone_number
-             RETURNING *`,
-            [target]
-          );
+          await reply(`⚠️ @${target} n'est pas encore inscrit. Tapez \`/sign <pseudo>\` pour s'inscrire.`);
+          return;
         }
 
         const m = res.rows[0];
-        const displayName = m.username && m.username !== m.phone_number ? m.username : `@${m.phone_number}`;
-        await reply(`👤 ${displayName}\n✨ XP : ${m.xp}\n📊 Niveau : ${m.level}`);
+        await reply(`👤 **${m.username}** (@${m.phone_number})\n✨ **XP** : ${m.xp}\n📊 **Niveau** : ${m.level}`);
       } catch (err) {
         logger.error({ err }, '[DB ERROR] /xp');
         await reply('Erreur DB lors de la récupération de l’XP.');
@@ -658,13 +648,12 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       try {
         const res = await queryWithTimeout('SELECT * FROM users ORDER BY xp DESC LIMIT 20');
         if (res.rows.length === 0) {
-          await reply('Aucun membre enregistré.');
+          await reply('Aucun membre inscrit pour le moment.');
           return;
         }
         const lines = res.rows.map((m, i) => {
           const medal = MEDALS[i] || `#${i+1}`;
-          const name = m.username && m.username !== m.phone_number ? m.username : `@${m.phone_number}`;
-          return `${medal} ${name} - ${m.xp} XP (Niv. ${m.level})`;
+          return `${medal} ${m.username} - ${m.xp} XP (Niv. ${m.level})`;
         });
         await reply(`🏆 Classement XP 🏆\n\n${lines.join('\n')}`);
       } catch (err) {
