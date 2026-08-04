@@ -1,5 +1,9 @@
 FROM node:18-alpine
 
+# Installer git (nécessaire pour certaines dépendances comme whatsapp-web.js)
+# et autres outils utiles (optionnel)
+RUN apk add --no-cache git
+
 WORKDIR /app
 
 # Copier les fichiers de dépendances

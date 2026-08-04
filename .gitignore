@@ -1,11 +1,6 @@
-# Node
 node_modules/
 .env
 *.log
-
-# Sessions WhatsApp
 .wwebjs_auth/
 .baileys_auth/
-
-# Autres
 .DS_Store
