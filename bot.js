@@ -353,6 +353,39 @@ async function flushPendingXP() {
 setInterval(flushPendingXP, 60 * 1000);
 
 // =========================================================================
+// 8.5. ROUTINE DE NETTOYAGE RAM & DE RECONSTITUTION DU CACHE (CHAQUE 10 MIN)
+// =========================================================================
+async function clearRamAndResetCache() {
+  logger.info('[MEMORY CLEANUP] 🧹 Début de la procédure de purge de la mémoire RAM...');
+  try {
+    // 1. Sauvegarde impérative de toutes les données d'XP en attente dans la base de données
+    await flushPendingXP();
+    logger.info('[MEMORY CLEANUP] ✅ Sauvegarde prioritaire de l’XP terminée.');
+
+    // 2. Vidage complet des maps et des ensembles temporaires
+    processingMessages.clear();
+    pendingXP.clear();
+    cachedGroups.clear();
+    cachedAdmins.clear();
+
+    // 3. Reconstitution à neuf du cache à partir de Supabase
+    await refreshCaches();
+    logger.info('[MEMORY CLEANUP] 🔄 Caches système rechargés à neuf depuis la base de données.');
+
+    // 4. Déclenchement du Garbarge Collector Node.js si activé (--expose-gc)
+    if (global.gc) {
+      global.gc();
+      logger.info('[MEMORY CLEANUP] 🗑️ Garbage Collector exécuté avec succès.');
+    }
+  } catch (err) {
+    logger.error({ err }, '[MEMORY CLEANUP] 🔴 Erreur durant la purge de la mémoire RAM');
+  }
+}
+
+// Exécution du nettoyage de la mémoire toutes les 10 minutes
+setInterval(clearRamAndResetCache, 10 * 60 * 1000);
+
+// =========================================================================
 // 9. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
