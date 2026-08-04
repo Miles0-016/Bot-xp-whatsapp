@@ -4,7 +4,7 @@
  * - Serveur Express démarré en premier
  * - Logs de connexion ultra-détaillés : QR, connexion, synchronisation, ready
  * - Gestion de session persistante (MultiFileAuthState)
- * - Toute la logique métier (Supabase, caches, XP batching)
+ * - Toute la logique métier (Supabase, caches, XP batching avec UPSERT automatique)
  */
 
 // =========================================================================
@@ -139,17 +139,15 @@ async function refreshCaches() {
 setInterval(refreshCaches, 60 * 1000);
 
 // =========================================================================
-// 5. PERMISSIONS
+// 5. PERMISSIONS ET UTILITAIRES DE NUMÉRO
 // =========================================================================
 function numberFromJid(jid) {
   if (!jid) return '';
   // Nettoie strictement le JID pour ne garder que le numéro pur (sans :55 ou @g.us/@s.whatsapp.net)
-  return jid.split('@')[0].split(':')[0].trim();
+  return jid.split('@')[0].split(':')[0].replace(/\D/g, '').trim();
 }
 
 function senderNumberFromMsg(msg) {
-  // FIX CRITIQUE: Si le message vient du compte du bot (fromMe === true), 
-  // l'expéditeur EST le bot (ou toi qui utilises le compte du bot sur ton tel).
   if (msg.key.fromMe) {
     return BOT_NUMBER || numberFromJid(sock?.user?.id);
   }
@@ -266,7 +264,7 @@ async function startSock() {
 }
 
 // =========================================================================
-// 7. XP BATCHING
+// 7. XP BATCHING (AVEC AUTOMATIC USER CREATION / UPSERT)
 // =========================================================================
 let pendingXP = new Map();
 
@@ -277,16 +275,20 @@ async function flushPendingXP() {
   console.log(`[XP FLUSH] ${batch.size} entrées`);
   for (const [key, count] of batch) {
     const [groupJid, phoneNumber] = key.split('|');
+    if (!phoneNumber) continue;
     try {
+      // UPSERT: Crée automatiquement le membre en DB s'il n'existe pas encore !
       const res = await queryWithTimeout(
-        `UPDATE users SET xp = xp + $1, level = floor((xp + $1)/500)+1 WHERE phone_number = $2 RETURNING xp`,
-        [count, phoneNumber]
+        `INSERT INTO users (phone_number, username, xp, level)
+         VALUES ($1, $2, $3, floor($3/500)+1)
+         ON CONFLICT (phone_number) 
+         DO UPDATE SET 
+            xp = users.xp + EXCLUDED.xp,
+            level = floor((users.xp + EXCLUDED.xp)/500) + 1
+         RETURNING xp, level`,
+        [phoneNumber, phoneNumber, count]
       );
-      if (res.rowCount > 0) {
-        console.log(`[XP SAVE] +${count} pour ${phoneNumber} (total ${res.rows[0].xp})`);
-      } else {
-        console.warn(`[XP SAVE] ${phoneNumber} non enregistré`);
-      }
+      console.log(`[XP SAVE] +${count} pour ${phoneNumber} (total ${res.rows[0].xp} XP)`);
     } catch (err) {
       console.error(`[XP ERROR] ${phoneNumber}:`, err.message);
       pendingXP.set(key, (pendingXP.get(key) || 0) + count);
@@ -299,7 +301,6 @@ setInterval(flushPendingXP, 60 * 1000);
 // 8. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
-  // Ignorer messages système / protocoles vides
   if (!msg.message || msg.message.protocolMessage) return;
 
   const from = msg.key.remoteJid;
@@ -356,9 +357,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
   const [raw, ...args] = body.split(/\s+/);
   const command = raw.toLowerCase();
   
-  // Récupération de l'expéditeur via la fonction sécurisée
   const senderNumber = senderNumberFromMsg(msg);
-
   console.log(`[CMD] ${command} de ${senderNumber} (fromMe=${msg.key.fromMe})`);
 
   const reply = async (text) => {
@@ -409,7 +408,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         await reply(`✅ Groupe activé (${cachedGroups.size}/${MAX_GROUPS}).`);
       } catch (err) {
         console.error('[DB ERROR] /activer-groupe:', err.message);
-        await reply('Erreur DB.');
+        await reply(`Erreur DB: ${err.message}`);
       }
       break;
     }
@@ -449,19 +448,19 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       const delta = command === '/addxp' ? amount : -amount;
       try {
         const result = await queryWithTimeout(
-          `UPDATE users SET xp = GREATEST(0, xp + $1),
-            level = floor(GREATEST(0, xp + $1)/500)+1
-           WHERE phone_number = $2 RETURNING *`,
-          [delta, targetNumber]
+          `INSERT INTO users (phone_number, username, xp, level)
+           VALUES ($1, $1, GREATEST(0, $2), floor(GREATEST(0, $2)/500)+1)
+           ON CONFLICT (phone_number) 
+           DO UPDATE SET 
+              xp = GREATEST(0, users.xp + EXCLUDED.xp),
+              level = floor(GREATEST(0, users.xp + EXCLUDED.xp)/500) + 1
+           RETURNING *`,
+          [targetNumber, delta]
         );
-        if (result.rows.length === 0) {
-          await reply('Membre non enregistré.');
-          return;
-        }
         const member = result.rows[0];
         const verb = command === '/addxp' ? 'ajouté' : 'retiré';
         await reply(
-          `L'admin vient de ${verb} ${amount} XP à ${member.username || targetNumber} (total: ${member.xp} XP)`
+          `L'admin vient de ${verb} ${amount} XP à @${targetNumber} (total: ${member.xp} XP)`
         );
       } catch (err) {
         console.error(`[DB ERROR] ${command}:`, err.message);
@@ -516,16 +515,25 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     case '/xp': {
       const target = await resolveTargetNumber(msg);
       try {
-        const res = await queryWithTimeout('SELECT * FROM users WHERE phone_number = $1', [target]);
+        let res = await queryWithTimeout('SELECT * FROM users WHERE phone_number = $1', [target]);
+        
+        // Auto-création si l'utilisateur n'existe pas encore en DB
         if (res.rows.length === 0) {
-          await reply('Membre non enregistré.');
-          return;
+          res = await queryWithTimeout(
+            `INSERT INTO users (phone_number, username, xp, level)
+             VALUES ($1, $1, 0, 1)
+             ON CONFLICT (phone_number) DO UPDATE SET phone_number = EXCLUDED.phone_number
+             RETURNING *`,
+            [target]
+          );
         }
+
         const m = res.rows[0];
-        await reply(`${m.username} : ${m.xp} XP (niveau ${m.level})`);
+        const displayName = m.username && m.username !== m.phone_number ? m.username : `@${m.phone_number}`;
+        await reply(`👤 ${displayName}\n✨ XP : ${m.xp}\n📊 Niveau : ${m.level}`);
       } catch (err) {
         console.error('[DB ERROR] /xp:', err.message);
-        await reply('Erreur DB.');
+        await reply('Erreur DB lors de la récupération de l’XP.');
       }
       break;
     }
@@ -535,14 +543,15 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       try {
         const res = await queryWithTimeout('SELECT * FROM users ORDER BY xp DESC LIMIT 20');
         if (res.rows.length === 0) {
-          await reply('Aucun membre.');
+          await reply('Aucun membre enregistré.');
           return;
         }
         const lines = res.rows.map((m, i) => {
           const medal = MEDALS[i] || `#${i+1}`;
-          return `${medal} ${m.username} - ${m.xp} XP`;
+          const name = m.username && m.username !== m.phone_number ? m.username : `@${m.phone_number}`;
+          return `${medal} ${name} - ${m.xp} XP (Niv. ${m.level})`;
         });
-        await reply(`Classement XP\n\n${lines.join('\n')}`);
+        await reply(`🏆 Classement XP 🏆\n\n${lines.join('\n')}`);
       } catch (err) {
         console.error('[DB ERROR] /top:', err.message);
         await reply('Erreur DB.');
