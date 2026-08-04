@@ -2,9 +2,8 @@
  * bot.js - Bot WhatsApp XP avec Baileys (léger, sans Puppeteer)
  * 
  * - Serveur Express démarré en premier
- * - Logs de connexion ultra-détaillés
+ * - Logs de connexion ultra-détaillés : QR, connexion, synchronisation, ready
  * - Gestion de session persistante (MultiFileAuthState)
- * - Double écoute des messages (message et commandes)
  * - Toute la logique métier inchangée (Supabase, caches, XP batching)
  */
 
@@ -20,7 +19,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
   Browsers,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
@@ -141,7 +139,6 @@ function numberFromJid(jid) {
   return (jid || '').split('@')[0];
 }
 function senderNumberFromMsg(msg) {
-  // msg.key.fromMe ? : msg.key.remoteJid? ou participant?
   const fromMe = msg.key.fromMe;
   if (fromMe) return BOT_NUMBER || numberFromJid(msg.key.remoteJid);
   return numberFromJid(msg.key.participant || msg.key.remoteJid);
@@ -149,7 +146,6 @@ function senderNumberFromMsg(msg) {
 function isSuperAdminNumber(n) { return SUPER_ADMIN_NUMBERS.includes(n); }
 function isBotAdmin(n) { return isSuperAdminNumber(n) || cachedAdmins.has(n); }
 
-// Pour les mentions, Baileys les fournit dans msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
 async function resolveTargetNumber(msg) {
   const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
   if (contextInfo && contextInfo.mentionedJid && contextInfo.mentionedJid.length > 0) {
@@ -162,29 +158,31 @@ async function resolveTargetNumber(msg) {
 // 6. SOCKET WHATSAPP (BAILEYS)
 // =========================================================================
 let sock = null;
-let processingMessages = new Set(); // pour éviter les doublons
+let processingMessages = new Set();
 
 async function startSock() {
+  console.log('[BOOT] Initialisation du socket Baileys...');
   const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, '.baileys_auth'));
   const { version } = await fetchLatestBaileysVersion();
+  console.log(`[BOOT] Version Baileys: ${version.join('.')}`);
 
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: false, // on va le générer nous-mêmes
+    printQRInTerminal: false,
     browser: Browsers.macOS('Desktop'),
     logger: pino({ level: 'info', transport: { target: 'pino-pretty' } }),
     generateHighQualityLinkPreview: false,
-    getMessage: async () => undefined, // pour les réponses
-    shouldSyncHistoryMessage: () => false, // pour économiser la RAM
+    getMessage: async () => undefined,
+    shouldSyncHistoryMessage: () => false,
   });
 
-  // Événement : QR code
+  // Événement : connexion
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
     if (qr) {
-      console.log('[QR] Nouveau QR code généré');
+      console.log('[QR] 📱 Nouveau QR code généré (en attente de scan)');
       try {
         currentQRCodeBase64 = await QRCode.toDataURL(qr);
         console.log('[QR] QR code disponible sur la page web /');
@@ -195,7 +193,7 @@ async function startSock() {
     }
 
     if (connection === 'connecting') {
-      console.log('[CONNEXION] Connexion en cours...');
+      console.log('[CONNEXION] 🔄 Connexion en cours... (établissement du WebSocket)');
     }
 
     if (connection === 'open') {
@@ -203,15 +201,19 @@ async function startSock() {
       BOT_NUMBER = sock.user?.id ? numberFromJid(sock.user.id) : null;
       console.log(`[CONNEXION] ✅ CONNECTÉ ! Numéro du bot : ${BOT_NUMBER}`);
       console.log(`[CONNEXION] Mémoire utilisée : ${Math.round(process.memoryUsage().rss / 1024 / 1024)} Mo`);
-      await refreshCaches();
-      console.log(`[READY] ${cachedGroups.size} groupes actifs, ${cachedAdmins.size} admins.`);
+      console.log('[CONNEXION] Synchronisation des messages en cours... (quelques secondes)');
+      // On attend un peu pour que le socket soit stable
+      setTimeout(async () => {
+        await refreshCaches();
+        console.log(`[READY] Bot prêt. ${cachedGroups.size} groupes actifs, ${cachedAdmins.size} admins.`);
+      }, 2000);
     }
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       console.log(`[DISCONNECTED] Déconnecté, code: ${statusCode}`);
       if (statusCode !== DisconnectReason.loggedOut) {
-        console.log('[RECONNECT] Reconnexion dans 5 secondes...');
+        console.log('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
         setTimeout(startSock, 5000);
       } else {
         console.log('[RECONNECT] Déconnecté volontairement, arrêt.');
@@ -263,10 +265,9 @@ async function flushPendingXP() {
 setInterval(flushPendingXP, 60 * 1000);
 
 // =========================================================================
-// 8. TRAITEMENT DES MESSAGES (AVEC DÉDUPLICATION)
+// 8. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sock, msg) {
-  // Log brut
   const from = msg.key.remoteJid;
   const author = msg.key.participant || from;
   const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
@@ -284,27 +285,21 @@ async function handleIncomingMessage(sock, msg) {
     toDelete.forEach(id => processingMessages.delete(id));
   }
 
-  // Vérification groupe
   if (!from.endsWith('@g.us')) {
     console.log('[SKIP] Pas un groupe');
     return;
   }
 
-  // Ignorer les messages du bot
-  if (msg.key.fromMe) {
-    if (!body.startsWith('/')) {
-      console.log('[SKIP] Message du bot non-commande');
-      return;
-    }
+  if (msg.key.fromMe && !body.startsWith('/')) {
+    console.log('[SKIP] Message du bot non-commande');
+    return;
   }
 
-  // Commande ?
   if (body.startsWith('/')) {
     await handleCommand(sock, msg, from, body);
     return;
   }
 
-  // Crédit XP
   if (!cachedGroups.has(from)) {
     console.log(`[SKIP] Groupe ${from} non activé`);
     return;
@@ -328,12 +323,10 @@ async function handleCommand(sock, msg, chatJid, body) {
 
   console.log(`[CMD] ${command} de ${senderNumber}`);
 
-  // Fonction pour envoyer une réponse
   const reply = async (text) => {
     await sock.sendMessage(chatJid, { text }, { quoted: msg });
   };
 
-  // ---- /jid ----
   if (command === '/jid') {
     console.log(`[JID CMD] ${chatJid}`);
     await reply(`L'ID de ce chat est :\n\`${chatJid}\``);
@@ -517,7 +510,7 @@ async function handleCommand(sock, msg, chatJid, body) {
 }
 
 // =========================================================================
-// 10. DÉMARRAGE DU SOCKET
+// 10. DÉMARRAGE
 // =========================================================================
 console.log('[BOOT] Démarrage du bot avec Baileys...');
 startSock().then(s => {
