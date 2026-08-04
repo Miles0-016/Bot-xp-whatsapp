@@ -29,9 +29,6 @@ const {
 // 1. CONFIGURATION & LOGGER VERBOSE EXHAUSTIF
 // =========================================================================
 const logger = pino({
-  // 'debug' par defaut comme demande (tres verbeux, y compris les logs
-  // internes de Baileys). Repasser a 'info' ou 'warn' via LOG_LEVEL une fois
-  // le diagnostic termine, pour ne pas saturer les logs Render en continu.
   level: process.env.LOG_LEVEL || 'debug',
   serializers: { err: pino.stdSerializers.err },
   transport: process.env.PRETTY_LOGS === 'false'
@@ -193,18 +190,6 @@ function startKeepAlive(intervalMs = 5 * 60 * 1000) {
 // =========================================================================
 // 5bis. WATCHDOG SOCKET WHATSAPP (CORRECTIF PRINCIPAL DU GEL A 10-15 MIN)
 // =========================================================================
-// Diagnostic : le socket WebSocket sous-jacent peut devenir "zombie" - coupé
-// au niveau reseau (proxy Render, NAT, etc.) SANS jamais declencher
-// l'evenement 'close' de Baileys. Dans ce cas, `isReconnecting` reste false,
-// `connection.update` ne se relance jamais, et le bot reste indefiniment
-// "connecte" selon son propre etat interne tout en ne recevant plus aucun
-// evenement. keepAliveIntervalMs (ping WebSocket interne a Baileys) est
-// censé detecter ca, mais plusieurs environnements cloud le laissent passer.
-//
-// Ce watchdog fait un vrai aller-retour reseau (sendPresenceUpdate) toutes
-// les 60s. S'il timeout ou echoue, on considere le socket mort et on force
-// un redemarrage complet - au lieu d'attendre passivement un 'close' qui
-// peut ne jamais arriver.
 const WATCHDOG_INTERVAL_MS = 60 * 1000;
 const WATCHDOG_TIMEOUT_MS = 15 * 1000;
 let watchdogTimer = null;
@@ -236,12 +221,43 @@ function startWatchdog() {
       } catch (e) {
         logger.error({ err: e }, '⚠️ [WATCHDOG] Erreur lors de la fermeture forcée du socket mort');
       }
-      isReconnecting = false; // s'assurer qu'on peut relancer malgré l'etat precedent
+      isReconnecting = false;
       startSock().catch(e => logger.error({ err: e }, '💥 [WATCHDOG] Échec du redémarrage forcé'));
     }
   }, WATCHDOG_INTERVAL_MS);
 }
 startWatchdog();
+
+// =========================================================================
+// 5ter. AUTO-PING PRIVÉ (ANTI-INACTIVITÉ 5MIN - DEMANDE UTILISATEUR)[cite: 3]
+// =========================================================================
+let privatePingTimer = null;
+
+function startPrivatePing(intervalMs = 5 * 60 * 1000) {
+  if (privatePingTimer) clearInterval(privatePingTimer);
+  logger.info({ intervalMs }, '⏱️ [PRIVATE PING] Démarrage de l\'auto-ping en discussion privée (toutes les 5 min)');
+
+  privatePingTimer = setInterval(async () => {
+    if (!sock || isReconnecting) return;
+    
+    // On prend le premier super admin comme cible par défaut pour la discussion privée
+    const targetAdminNumber = SUPER_ADMIN_NUMBERS[0];
+    if (!targetAdminNumber) {
+      logger.warn('⚠️ [PRIVATE PING] Impossible d\'envoyer le ping privé : Aucun SUPER_ADMIN_NUMBERS configuré.');
+      return;
+    }
+
+    const privateJid = `${targetAdminNumber}@s.whatsapp.net`;
+
+    try {
+      logger.info({ privateJid }, '📤 [PRIVATE PING] Envoi du message automatique anti-inactivité...');
+      await sock.sendMessage(privateJid, { text: '🤖 [Auto-Ping Anti-Inactivité] Le bot est bien actif !' });
+      logger.info('✅ [PRIVATE PING] Message anti-inactivité envoyé avec succès.');
+    } catch (err) {
+      logger.error({ err, privateJid }, '❌ [PRIVATE PING] Échec de l\'envoi du message privé anti-inactivité');
+    }
+  }, intervalMs);
+}
 
 // =========================================================================
 // 6. PERMISSIONS ET UTILITAIRES DE NUMÉRO
@@ -314,7 +330,6 @@ async function startSock() {
     browser: Browsers.macOS('Desktop'),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
-    // 🔹 FIX CRITIQUE: Force la ré-authentification si une clé de session est corrompue/manquante
     badSessionTokenWithNoRetry: false,
     appStateMacVerification: {
       patch: false,
@@ -324,10 +339,6 @@ async function startSock() {
     syncFullHistory: false,
     fireInitQueries: false,
     markOnlineOnConnect: false,
-    // CORRIGÉ : `false` empêchait les messages envoyés par le numéro du bot
-    // lui-même de déclencher 'messages.upsert' - or c'est justement le cas
-    // d'usage central de ce bot (numéro du bot = numéro utilisé pour taper
-    // les commandes /activer-groupe, etc.).
     emitOwnEvents: true,
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
@@ -363,6 +374,7 @@ async function startSock() {
       logger.info(`🎉 [CONNEXION SUCCÈS] Connecté à WhatsApp ! Numéro du Bot : ${BOT_NUMBER}`);
       
       startKeepAlive(5 * 60 * 1000);
+      startPrivatePing(5 * 60 * 1000); // Lancement de l'auto-ping privé toutes les 5 min
 
       setTimeout(async () => {
         logger.info('⚡ [INITIALISATION POST-CONNEXION] Lancement du premier rafraîchissement du cache...');
@@ -374,6 +386,7 @@ async function startSock() {
     if (connection === 'close') {
       isReconnecting = false;
       if (keepAliveTimer) clearInterval(keepAliveTimer);
+      if (privatePingTimer) clearInterval(privatePingTimer);
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       logger.warn({ statusCode, err: lastDisconnect?.error }, '⚠️ [DECONNEXION] Connexion WhatsApp fermée.');
@@ -481,7 +494,6 @@ setInterval(() => {
 // 9. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
-  // 🔹 FIX CRITIQUE: Filtrer les messages système, les ratés de déchiffrement et les stubs
   if (!msg || !msg.message || msg.message.protocolMessage || msg.messageStubType) return;
 
   const from = msg.key?.remoteJid;
@@ -679,7 +691,6 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       const delta = command === '/addxp' ? amount : -amount;
       try {
         logger.info({ targetNumber, delta }, '📥 [TRANSFERT XP ADMIN] Envoi de la requête de modification XP');
-        // 🔹 FIX SECURITY: Recalcul correct du niveau en cas de réduction/ajout
         const result = await queryWithTimeout(
           `UPDATE users 
            SET xp = GREATEST(0, xp + $2),
@@ -886,6 +897,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   logger.warn({ signal }, `🛑 [SHUTDOWN] Signal ${signal} reçu. Nettoyage et arrêt du bot...`);
   if (keepAliveTimer) clearInterval(keepAliveTimer);
+  if (privatePingTimer) clearInterval(privatePingTimer);
   logger.info('💾 [SHUTDOWN] Sauvegarde forcée des XP en attente avant fermeture...');
   await flushPendingXP();
   if (pool) {
