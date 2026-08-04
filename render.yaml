@@ -1,0 +1,33 @@
+# Configuration Render - Module 2 (Bot WhatsApp)
+#
+# IMPORTANT : ce service DOIT tourner sur un plan payant (Starter minimum).
+# Le plan Free de Render met le service en veille apres 15 min d'inactivite HTTP,
+# ce qui coupe la connexion WhatsApp en continu — inacceptable pour un bot cense
+# tourner 24h/24. Le disque persistant (session WhatsApp) n'est de toute facon
+# pas disponible sur le plan Free.
+#
+# Utilisation (optionnelle) : si ce fichier est present a la racine du depot,
+# Render propose de creer le service automatiquement via "New +" > "Blueprint".
+# Sinon, suis la configuration manuelle detaillee fournie a cote.
+
+services:
+  - type: web
+    name: xp-whatsapp-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false # chaine de connexion Supabase (secret, a definir manuellement)
+      - key: SUPER_ADMIN_NUMBERS
+        sync: false # ex: "2376xxxxxxxx,2376yyyyyyyy"
+      - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
+        value: "true"
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
+    disk:
+      name: wwebjs-auth
+      mountPath: /app/.wwebjs_auth
+      sizeGB: 1

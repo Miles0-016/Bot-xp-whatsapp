@@ -1,0 +1,9 @@
+# Dependances
+node_modules/
+
+# Session WhatsApp (LocalAuth) et cache Puppeteer/Chromium
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Fichiers lourds ou generes
+module2-bot.zip

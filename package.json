@@ -1,0 +1,22 @@
+{
+  "name": "xp-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Module 2 - Bot WhatsApp de gestion d'XP (whatsapp-web.js)",
+  "main": "bot.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "zip": "node make-zip.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.26.0",
+    "qrcode": "^1.5.3",
+    "pg": "^8.12.0",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "archiver": "^7.0.1"
+  }
+}
