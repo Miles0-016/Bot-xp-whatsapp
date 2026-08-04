@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (Inscriptions strictes, Purge RAM 5min & AppState Fix)
+ * bot.js - Bot WhatsApp XP avec Baileys (Stabilisé & Optimisé)
  */
 
 // =========================================================================
@@ -142,7 +142,6 @@ async function refreshCaches() {
     const admins = await queryWithTimeout('SELECT phone_number FROM bot_admins');
     const newAdmins = new Set(admins.rows.map(r => r.phone_number));
 
-    // Remplacement atomique : l'ancien cache reste 100% fonctionnel pendant la requête DB
     cachedGroups = newGroups;
     cachedAdmins = newAdmins;
     
@@ -154,27 +153,16 @@ async function refreshCaches() {
 setInterval(refreshCaches, 60 * 1000);
 
 // =========================================================================
-// 5. FONCTION KEEP-ALIVE
+// 5. FONCTION KEEP-ALIVE (BDD SEULEMENT)
 // =========================================================================
 function startKeepAlive(intervalMs = 5 * 60 * 1000) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
 
   keepAliveTimer = setInterval(async () => {
-    logger.info('[KEEP-ALIVE] ⏰ Exécution de l’opération de réveil (Ping 5min)...');
-
-    if (sock && sock.ws && sock.ws.isOpen) {
-      try {
-        sock.ws.ping();
-        logger.info('[KEEP-ALIVE] 🟢 Ping WebSocket envoyé avec succès à WhatsApp.');
-      } catch (err) {
-        logger.error({ err }, '[KEEP-ALIVE] 🔴 Échec du ping WebSocket.');
-      }
-    }
-
     if (pool) {
       try {
         await queryWithTimeout('SELECT 1');
-        logger.info('[KEEP-ALIVE] 🟢 Ping Base de Données réussi.');
+        logger.debug('[KEEP-ALIVE] 🟢 Ping Base de Données réussi.');
       } catch (err) {
         logger.error({ err }, '[KEEP-ALIVE] 🔴 Échec du ping Base de Données.');
       }
@@ -215,7 +203,7 @@ async function resolveTargetNumber(msg) {
 }
 
 // =========================================================================
-// 7. SOCKET WHATSAPP (BAILEYS)
+// 7. SOCKET WHATSAPP (BAILEYS - CORRIGÉ STABILITÉ OVL)
 // =========================================================================
 let sock = null;
 let processingMessages = new Set();
@@ -225,23 +213,17 @@ async function startSock() {
   if (isReconnecting) return;
   isReconnecting = true;
 
-  // FIX APP STATE SYNC: Nettoyage des clés de synchro corrompues avant le démarrage
-  const authDir = path.join(__dirname, '.baileys_auth');
-  if (fs.existsSync(authDir)) {
+  // Si une instance existe déjà, purge des listeners pour éviter les fuites de mémoire
+  if (sock) {
     try {
-      const files = fs.readdirSync(authDir);
-      for (const file of files) {
-        if (file.startsWith('app-state-sync-')) {
-          fs.unlinkSync(path.join(authDir, file));
-        }
-      }
-      logger.info('[BOOT] Nettoyage des clés app-state-sync- corrompues effectué.');
-    } catch (err) {
-      logger.error({ err }, '[BOOT] Erreur lors du nettoyage de .baileys_auth');
-    }
+      sock.ev.removeAllListeners();
+      sock.ws?.close();
+    } catch (_) {}
   }
 
+  const authDir = path.join(__dirname, '.baileys_auth');
   logger.info('[BOOT] Initialisation du socket Baileys...');
+  
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
   logger.info(`[BOOT] Version Baileys: ${version.join('.')}`);
@@ -254,25 +236,20 @@ async function startSock() {
     browser: Browsers.macOS('Desktop'),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
-
-    // FIX ERREUR "tried remove, but no previous op": Désactive la vérification MAC d'App State
     appStateMacVerification: {
       patch: false,
       snapshot: false,
     },
-
-    // Désactivation de la synchronisation d'historique et d'état
     shouldSyncHistoryMessage: () => false,
     syncFullHistory: false,
     fireInitQueries: false,
     markOnlineOnConnect: false,
-
-    keepAliveIntervalMs: 15000,
+    keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     retryRequestOptions: {
-      maxRetries: 3,
-      delayMs: 250,
+      maxRetries: 5,
+      delayMs: 500,
     },
   });
 
@@ -317,8 +294,8 @@ async function startSock() {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
       if (shouldReconnect) {
-        logger.info('[RECONNECT] Tentative de reconnexion dans 3 secondes...');
-        setTimeout(() => startSock(), 3000);
+        logger.info('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
+        setTimeout(() => startSock(), 5000);
       } else {
         logger.error('[RECONNECT] Session fermée de manière définitive (Déconnecté).');
       }
@@ -327,15 +304,18 @@ async function startSock() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
 
+    // Traitement asynchrone pour ne jamais bloquer la boucle du socket
     for (const msg of messages) {
-      try {
-        await handleIncomingMessage(sock, msg);
-      } catch (err) {
-        logger.error({ err }, '[MSG ERROR] Erreur lors du traitement du message');
-      }
+      setImmediate(async () => {
+        try {
+          await handleIncomingMessage(sock, msg);
+        } catch (err) {
+          logger.error({ err }, '[MSG ERROR] Erreur traitement message');
+        }
+      });
     }
   });
 
@@ -349,9 +329,8 @@ let pendingXP = new Map();
 
 async function flushPendingXP() {
   if (!pool || pendingXP.size === 0) return;
-  const batch = pendingXP;
-  pendingXP = new Map();
-  logger.info(`[XP FLUSH] Sauvegarde des points d'XP accumulés...`);
+  const batch = new Map(pendingXP);
+  pendingXP.clear();
   
   for (const [key, count] of batch) {
     const [groupJid, phoneNumber] = key.split('|');
@@ -368,8 +347,6 @@ async function flushPendingXP() {
       
       if (res.rowCount > 0) {
         logger.debug(`[XP SAVE] +${count} XP -> ${res.rows[0].username} (Total: ${res.rows[0].xp})`);
-      } else {
-        logger.debug(`[XP IGNORED] Numéro ${phoneNumber} non inscrit, message ignoré.`);
       }
     } catch (err) {
       logger.error({ err, phoneNumber }, '[XP ERROR] Échec mise à jour XP');
@@ -378,34 +355,12 @@ async function flushPendingXP() {
 }
 setInterval(flushPendingXP, 60 * 1000);
 
-// =========================================================================
-// 8.5. ROUTINE DE NETTOYAGE RAM SÉCURISÉE (CHAQUE 5 MIN)
-// =========================================================================
-async function clearRamAndResetCache() {
-  logger.info('[MEMORY CLEANUP] 🧹 Début de la procédure de purge de la mémoire RAM (5 min)...');
-  try {
-    // 1. Sauvegarde impérative de toutes les données d'XP en attente dans la base de données
-    await flushPendingXP();
-    logger.info('[MEMORY CLEANUP] ✅ Sauvegarde prioritaire de l’XP terminée.');
-
-    // 2. Vidage uniquement des structures de messages temporaires (PAS les caches de groupes/admins)
+// Purge légère des IDs de messages pour éviter la saturation mémoire sans bloquer le thread
+setInterval(() => {
+  if (processingMessages.size > 2000) {
     processingMessages.clear();
-
-    // 3. Reconstitution du cache proprement via remplacement atomique
-    await refreshCaches();
-
-    // 4. Déclenchement du Garbage Collector Node.js si activé (--expose-gc)
-    if (global.gc) {
-      global.gc();
-      logger.info('[MEMORY CLEANUP] 🗑️ Garbage Collector exécuté avec succès.');
-    }
-  } catch (err) {
-    logger.error({ err }, '[MEMORY CLEANUP] 🔴 Erreur durant la purge de la mémoire RAM');
   }
-}
-
-// Exécution du nettoyage de la mémoire toutes les 5 minutes
-setInterval(clearRamAndResetCache, 5 * 60 * 1000);
+}, 10 * 60 * 1000);
 
 // =========================================================================
 // 9. TRAITEMENT DES MESSAGES
@@ -424,12 +379,6 @@ async function handleIncomingMessage(sockInstance, msg) {
   if (msgId && processingMessages.has(msgId)) return;
   if (msgId) processingMessages.add(msgId);
 
-  const msgTimeout = setTimeout(() => {
-    if (msgId && processingMessages.has(msgId)) {
-      processingMessages.delete(msgId);
-    }
-  }, 10000);
-
   try {
     if (!from.endsWith('@g.us')) return;
     if (msg.key.fromMe && !body.startsWith('/')) return;
@@ -447,8 +396,9 @@ async function handleIncomingMessage(sockInstance, msg) {
     const key = `${from}|${authorNumber}`;
     pendingXP.set(key, (pendingXP.get(key) || 0) + XP_PER_MESSAGE);
   } finally {
-    clearTimeout(msgTimeout);
-    if (msgId) processingMessages.delete(msgId);
+    if (msgId) {
+      setTimeout(() => processingMessages.delete(msgId), 10000);
+    }
   }
 }
 
