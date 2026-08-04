@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (Inscriptions strictes & Keep-Alive 5 min)
+ * bot.js - Bot WhatsApp XP avec Baileys (Inscriptions strictes, Purge RAM 5min & AppState Fix)
  */
 
 // =========================================================================
@@ -10,6 +10,7 @@ if (!globalThis.crypto) {
 }
 
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const QRCode = require('qrcode');
 const { Pool } = require('pg');
@@ -220,8 +221,24 @@ async function startSock() {
   if (isReconnecting) return;
   isReconnecting = true;
 
+  // FIX APP STATE SYNC: Nettoyage des clés de synchro corrompues avant le démarrage
+  const authDir = path.join(__dirname, '.baileys_auth');
+  if (fs.existsSync(authDir)) {
+    try {
+      const files = fs.readdirSync(authDir);
+      for (const file of files) {
+        if (file.startsWith('app-state-sync-')) {
+          fs.unlinkSync(path.join(authDir, file));
+        }
+      }
+      logger.info('[BOOT] Nettoyage des clés app-state-sync- corrompues effectué.');
+    } catch (err) {
+      logger.error({ err }, '[BOOT] Erreur lors du nettoyage de .baileys_auth');
+    }
+  }
+
   logger.info('[BOOT] Initialisation du socket Baileys...');
-  const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, '.baileys_auth'));
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
   logger.info(`[BOOT] Version Baileys: ${version.join('.')}`);
 
@@ -234,13 +251,19 @@ async function startSock() {
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
 
-    // FIX CRITIQUE: Désactivation de la synchronisation d'historique et d'état (évite la boucle de crash)
+    // FIX ERREUR "tried remove, but no previous op": Désactive la vérification MAC d'App State
+    appStateMacVerification: {
+      patch: false,
+      snapshot: false,
+    },
+
+    // Désactivation de la synchronisation d'historique et d'état
     shouldSyncHistoryMessage: () => false,
     syncFullHistory: false,
     fireInitQueries: false,
     markOnlineOnConnect: false,
 
-    keepAliveIntervalMs: 25000,
+    keepAliveIntervalMs: 15000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     retryRequestOptions: {
@@ -330,7 +353,6 @@ async function flushPendingXP() {
     const [groupJid, phoneNumber] = key.split('|');
     if (!phoneNumber) continue;
     try {
-      // UPDATE strict : Seuls les membres déjà enregistrés dans BDD reçoivent l'XP.
       const res = await queryWithTimeout(
         `UPDATE users 
          SET xp = xp + $2,
@@ -353,16 +375,16 @@ async function flushPendingXP() {
 setInterval(flushPendingXP, 60 * 1000);
 
 // =========================================================================
-// 8.5. ROUTINE DE NETTOYAGE RAM & DE RECONSTITUTION DU CACHE (CHAQUE 10 MIN)
+// 8.5. ROUTINE DE NETTOYAGE RAM & DE RECONSTITUTION DU CACHE (CHAQUE 5 MIN)
 // =========================================================================
 async function clearRamAndResetCache() {
-  logger.info('[MEMORY CLEANUP] 🧹 Début de la procédure de purge de la mémoire RAM...');
+  logger.info('[MEMORY CLEANUP] 🧹 Début de la procédure de purge de la mémoire RAM (5 min)...');
   try {
     // 1. Sauvegarde impérative de toutes les données d'XP en attente dans la base de données
     await flushPendingXP();
     logger.info('[MEMORY CLEANUP] ✅ Sauvegarde prioritaire de l’XP terminée.');
 
-    // 2. Vidage complet des maps et des ensembles temporaires
+    // 2. Vidage complet des maps et ensembles temporaires
     processingMessages.clear();
     pendingXP.clear();
     cachedGroups.clear();
@@ -372,7 +394,7 @@ async function clearRamAndResetCache() {
     await refreshCaches();
     logger.info('[MEMORY CLEANUP] 🔄 Caches système rechargés à neuf depuis la base de données.');
 
-    // 4. Déclenchement du Garbarge Collector Node.js si activé (--expose-gc)
+    // 4. Déclenchement du Garbage Collector Node.js si activé (--expose-gc)
     if (global.gc) {
       global.gc();
       logger.info('[MEMORY CLEANUP] 🗑️ Garbage Collector exécuté avec succès.');
@@ -382,8 +404,8 @@ async function clearRamAndResetCache() {
   }
 }
 
-// Exécution du nettoyage de la mémoire toutes les 10 minutes
-setInterval(clearRamAndResetCache, 10 * 60 * 1000);
+// Exécution du nettoyage de la mémoire toutes les 5 minutes
+setInterval(clearRamAndResetCache, 5 * 60 * 1000);
 
 // =========================================================================
 // 9. TRAITEMENT DES MESSAGES
