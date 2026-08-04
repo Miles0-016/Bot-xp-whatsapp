@@ -233,11 +233,20 @@ async function startSock() {
     browser: Browsers.macOS('Desktop'),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
+
+    // FIX CRITIQUE: Désactivation de la synchronisation d'historique et d'état (évite la boucle de crash)
     shouldSyncHistoryMessage: () => false,
     syncFullHistory: false,
+    fireInitQueries: false,
+    markOnlineOnConnect: false,
+
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
+    retryRequestOptions: {
+      maxRetries: 3,
+      delayMs: 250,
+    },
   });
 
   sock.ev.on('connection.update', async (update) => {
