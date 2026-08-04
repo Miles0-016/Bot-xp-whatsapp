@@ -203,7 +203,7 @@ async function resolveTargetNumber(msg) {
 }
 
 // =========================================================================
-// 7. SOCKET WHATSAPP (BAILEYS - CORRIGÉ STABILITÉ OVL)
+// 7. SOCKET WHATSAPP (BAILEYS - CORRIGÉ CORRUPTION SESSION & SYNCHRO)
 // =========================================================================
 let sock = null;
 let processingMessages = new Set();
@@ -213,7 +213,6 @@ async function startSock() {
   if (isReconnecting) return;
   isReconnecting = true;
 
-  // Si une instance existe déjà, purge des listeners pour éviter les fuites de mémoire
   if (sock) {
     try {
       sock.ev.removeAllListeners();
@@ -236,14 +235,17 @@ async function startSock() {
     browser: Browsers.macOS('Desktop'),
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
+    // Annule la verification Mac/AppState qui cause l'erreur "tried remove, but no previous op"
     appStateMacVerification: {
       patch: false,
       snapshot: false,
     },
+    // Empêche la récupération de l'historique WhatsApp au démarrage
     shouldSyncHistoryMessage: () => false,
     syncFullHistory: false,
     fireInitQueries: false,
     markOnlineOnConnect: false,
+    emitOwnEvents: false,
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
@@ -297,7 +299,14 @@ async function startSock() {
         logger.info('[RECONNECT] Tentative de reconnexion dans 5 secondes...');
         setTimeout(() => startSock(), 5000);
       } else {
-        logger.error('[RECONNECT] Session fermée de manière définitive (Déconnecté).');
+        logger.error('[RECONNECT] Session fermée de manière définitive (Déconnecté). Nettoyage de la session...');
+        try {
+          fs.rmSync(authDir, { recursive: true, force: true });
+          logger.info('[RECONNECT] Dossier .baileys_auth supprimé avec succès.');
+        } catch (e) {
+          logger.error({ err: e }, '[RECONNECT] Échec de la suppression du dossier auth');
+        }
+        setTimeout(() => startSock(), 5000);
       }
     }
   });
@@ -307,7 +316,6 @@ async function startSock() {
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
 
-    // Traitement asynchrone pour ne jamais bloquer la boucle du socket
     for (const msg of messages) {
       setImmediate(async () => {
         try {
@@ -355,7 +363,7 @@ async function flushPendingXP() {
 }
 setInterval(flushPendingXP, 60 * 1000);
 
-// Purge légère des IDs de messages pour éviter la saturation mémoire sans bloquer le thread
+// Purge légère des IDs de messages
 setInterval(() => {
   if (processingMessages.size > 2000) {
     processingMessages.clear();
@@ -620,7 +628,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 
     case '/remove-admin':
       if (!isSuperAdminNumber(senderNumber)) {
-        await reply('Seul un Super Admin peut faire cela.');
+        await reply('Seul un Super Admin me permet de faire cela.');
         return;
       }
       try {
