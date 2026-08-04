@@ -148,13 +148,22 @@ function numberFromJid(jid) {
 }
 
 function senderNumberFromMsg(msg) {
-  const fromMe = msg.key.fromMe;
-  if (fromMe) return BOT_NUMBER || numberFromJid(msg.key.remoteJid);
+  // FIX CRITIQUE: Si le message vient du compte du bot (fromMe === true), 
+  // l'expéditeur EST le bot (ou toi qui utilises le compte du bot sur ton tel).
+  if (msg.key.fromMe) {
+    return BOT_NUMBER || numberFromJid(sock?.user?.id);
+  }
   return numberFromJid(msg.key.participant || msg.key.remoteJid);
 }
 
-function isSuperAdminNumber(n) { return SUPER_ADMIN_NUMBERS.includes(n); }
-function isBotAdmin(n) { return isSuperAdminNumber(n) || cachedAdmins.has(n); }
+function isSuperAdminNumber(n) { 
+  if (!n) return false;
+  return SUPER_ADMIN_NUMBERS.includes(n); 
+}
+
+function isBotAdmin(n) { 
+  return isSuperAdminNumber(n) || cachedAdmins.has(n); 
+}
 
 async function resolveTargetNumber(msg) {
   const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
@@ -346,10 +355,11 @@ async function handleIncomingMessage(sockInstance, msg) {
 async function handleCommand(sockInstance, msg, chatJid, body) {
   const [raw, ...args] = body.split(/\s+/);
   const command = raw.toLowerCase();
-  const sender = msg.key.participant || msg.key.remoteJid;
-  const senderNumber = numberFromJid(sender);
+  
+  // Récupération de l'expéditeur via la fonction sécurisée
+  const senderNumber = senderNumberFromMsg(msg);
 
-  console.log(`[CMD] ${command} de ${senderNumber}`);
+  console.log(`[CMD] ${command} de ${senderNumber} (fromMe=${msg.key.fromMe})`);
 
   const reply = async (text) => {
     await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
