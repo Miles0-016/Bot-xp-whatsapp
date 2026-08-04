@@ -1,9 +1,11 @@
-# Dependances
+# Node
 node_modules/
+.env
+*.log
 
-# Session WhatsApp (LocalAuth) et cache Puppeteer/Chromium
+# Sessions WhatsApp
 .wwebjs_auth/
-.wwebjs_cache/
+.baileys_auth/
 
-# Fichiers lourds ou generes
-module2-bot.zip
+# Autres
+.DS_Store
