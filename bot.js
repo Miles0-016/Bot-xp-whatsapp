@@ -362,7 +362,8 @@ async function useSupabaseAuthState() {
         }
       }
     },
-    saveCreds: () => writeData(state.creds, 'creds')
+    // CORRECTION APPORTÉE ICI : Utilisation de 'creds' au lieu de 'state.creds'
+    saveCreds: () => writeData(creds, 'creds')
   };
 }
 
