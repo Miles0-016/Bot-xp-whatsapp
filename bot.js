@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys & Auto-Ping Anti-Inactivité (Render)
+ * bot.js - Bot WhatsApp XP avec Baileys & Vidage Mémoire RAM (1 min)
  */
 
 // =========================================================================
@@ -15,7 +15,7 @@ const express = require('express');
 const QRCode = require('qrcode');
 const { Pool } = require('pg');
 const pino = require('pino');
-const http = require('http'); // Nécessaire pour l'auto-ping interne
+const http = require('http');
 
 // Baileys
 const {
@@ -52,6 +52,7 @@ let currentQRCodeBase64 = null;
 let BOT_NUMBER = null;
 let keepAliveTimer = null;
 let selfPingTimer = null;
+let memoryCleanTimer = null;
 
 // Anti-crash global
 process.on('uncaughtException', err => logger.error({ err }, '💥 [CRITICAL] Uncaught Exception intercepté'));
@@ -64,7 +65,6 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => {
-  logger.info({ ip: req.ip, userAgent: req.headers['user-agent'] }, '🌐 [HTTP GET /] Consultation de la page d\'accueil');
   if (currentQRCodeBase64) {
     res.send(`
       <!DOCTYPE html>
@@ -76,12 +76,11 @@ app.get('/', (req, res) => {
       </html>
     `);
   } else {
-    res.send('<html><body style="background:#0f172a;color:#4ade80;display:flex;justify-content:center;align-items:center;height:100vh;"><h2>✅ Bot en ligne 24h/24</h2></body></html>');
+    res.send('<html><body style="background:#0f172a;color:#4ade80;display:flex;justify-content:center;align-items:center;height:100vh;"><h2>✅ Bot en ligne 24h/24 (RAM Nettoyée)</h2></body></html>');
   }
 });
 
 app.get('/health', (req, res) => {
-  logger.info({ ip: req.ip }, '🔍 [HTTP GET /health] Check de santé demandé');
   res.status(200).json({
     status: 'ok',
     qrAvailable: currentQRCodeBase64 !== null,
@@ -96,36 +95,28 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   logger.info(`🚀 [HTTP] Serveur Express démarré sur le port ${PORT}`);
-  startSelfPing(); // Démarrage de l'auto-ping anti-veille Render
+  startSelfPing();
 });
 
-// Fonction pour auto-pinger l'application Render toutes les 4 minutes et empêcher la mise en veille
 function startSelfPing() {
   const appUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
   if (selfPingTimer) clearInterval(selfPingTimer);
   
-  logger.info({ appUrl }, '⏱️ [SELF-PING] Démarrage du mécanisme anti-inactivité Render (toutes les 4 min)');
-
   selfPingTimer = setInterval(() => {
-    http.get(`${appUrl}/health`, (res) => {
-      logger.info({ statusCode: res.statusCode }, '🟢 [SELF-PING] Auto-ping HTTP réussi, l\'application reste active.');
-    }).on('err', (err) => {
-      logger.error({ err }, '🔴 [SELF-PING] Échec de l\'auto-ping HTTP.');
-    });
-  }, 4 * 60 * 1000); // Toutes les 4 minutes
+    http.get(`${appUrl}/health`, (res) => {}).on('error', (err) => {});
+  }, 4 * 60 * 1000);
 }
 
 // =========================================================================
 // 3. BASE DE DONNÉES SUPABASE
 // =========================================================================
-logger.info('🐘 [DB] Connexion à la base de données Supabase...');
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: { rejectUnauthorized: false },
-      max: 5,
+      max: 3,
       connectionTimeoutMillis: 5000,
-      idleTimeoutMillis: 30000,
+      idleTimeoutMillis: 10000,
       statement_timeout: 5000,
       query_timeout: 5000,
     })
@@ -140,109 +131,111 @@ else {
 function queryWithTimeout(text, params) {
   if (!pool) return Promise.reject(new Error('Pool PostgreSQL non initialisé'));
 
-  const short = text.replace(/\s+/g, ' ').trim().slice(0, 140);
-  logger.info({ query: short, params }, '📥 [DB SQL EXEC] Exécution requête SQL');
-  
   const timeout = new Promise((_, reject) =>
     setTimeout(() => reject(new Error('Timeout Supabase (5s)')), 5000)
   );
   
-  return Promise.race([pool.query(text, params), timeout])
-    .then(result => {
-      logger.info({ query: short, rowsAffected: result.rowCount ?? result.rows?.length ?? 0 }, '📤 [DB SQL SUCCESS] Requête exécutée');
-      return result;
-    })
-    .catch(err => {
-      logger.error({ err, query: short, params }, '❌ [DB SQL ERROR] Échec de la requête SQL');
-      throw err;
-    });
+  return Promise.race([pool.query(text, params), timeout]);
 }
 
 // =========================================================================
-// 4. CACHES MÉMOIRE (SÉCURISÉS & ATOMIQUES)
+// 4. CACHES MÉMOIRE & NETTOYAGE RAM STRICT (TOUTES LES 1 MIN)
 // =========================================================================
 let cachedGroups = new Map();
 let cachedAdmins = new Set();
-let targetPingGroupJid = null; // Groupe configuré pour recevoir le ping automatique
+let targetPingGroupJid = null;
+let pendingXP = new Map();
+let processingMessages = new Set();
 
 async function refreshCaches() {
   if (!pool) return;
-  logger.info('🔄 [CACHE CHARGEMENT] Début du rafraîchissement des caches...');
   try {
     const groups = await queryWithTimeout('SELECT group_jid, group_name FROM authorized_groups');
-    const newGroups = new Map(groups.rows.map(r => [r.group_jid, r.group_name]));
+    cachedGroups = new Map(groups.rows.map(r => [r.group_jid, r.group_name]));
     
     const admins = await queryWithTimeout('SELECT phone_number FROM bot_admins');
-    const newAdmins = new Set(admins.rows.map(r => r.phone_number));
+    cachedAdmins = new Set(admins.rows.map(r => r.phone_number));
 
     try {
       const configRes = await queryWithTimeout("SELECT value FROM bot_config WHERE key = 'ping_target_group'");
       if (configRes.rows.length > 0) {
         targetPingGroupJid = configRes.rows[0].value;
       }
-    } catch (e) {
-      logger.debug('ℹ️ [CONFIG] Table bot_config non initialisée, pas de groupe de ping pré-enregistré.');
-    }
-
-    cachedGroups = newGroups;
-    cachedAdmins = newAdmins;
-    
-    logger.info({ 
-      groupesAutorises: Array.from(cachedGroups.keys()), 
-      adminsActifs: Array.from(cachedAdmins),
-      targetPingGroupJid
-    }, `✅ [CACHE CHARGÉ] Succès : ${cachedGroups.size} groupes, ${cachedAdmins.size} admins, Ping Group: ${targetPingGroupJid || 'Aucun'}`);
-  } catch (err) {
-    logger.error({ err }, '❌ [CACHE ERREUR] Échec du rafraîchissement des caches');
-  }
+    } catch (e) {}
+  } catch (err) {}
 }
 setInterval(refreshCaches, 60 * 1000);
 
+// --- FONCTION DE NETTOYAGE AGRESSIF DE LA RAM (Toutes les 1 min) ---
+function startMemoryCleaner() {
+  if (memoryCleanTimer) clearInterval(memoryCleanTimer);
+  logger.info('🧹 [RAM CLEANER] Démarrage du nettoyage de la RAM (toutes les 1 min)');
+
+  memoryCleanTimer = setInterval(async () => {
+    try {
+      // 1. Sauvegarde et vidage du cache XP en attente
+      if (pendingXP.size > 0) {
+        const batch = new Map(pendingXP);
+        pendingXP.clear(); // Vidage immédiat de la RAM
+        
+        for (const [key, count] of batch) {
+          const [groupJid, phoneNumber] = key.split('|');
+          if (!phoneNumber) continue;
+          try {
+            await queryWithTimeout(
+              `UPDATE users SET xp = xp + $2, level = floor((xp + $2)/500) + 1 WHERE phone_number = $1`,
+              [phoneNumber, count]
+            );
+          } catch (e) {}
+        }
+        logger.info('💾 [RAM CLEANER] Données XP flushées et purgées de la RAM.');
+      }
+
+      // 2. Vidage des messages traités en double pour éviter l'accumulation
+      if (processingMessages.size > 0) {
+        processingMessages.clear();
+      }
+
+      // 3. Demande au Garbage Collector de Node.js de nettoyer si disponible
+      if (global.gc) {
+        global.gc();
+      }
+      
+      logger.info({ memoryUsage: process.memoryUsage() }, '✨ [RAM CLEANER] Nettoyage RAM effectué avec succès.');
+    } catch (err) {
+      logger.error({ err }, '❌ [RAM CLEANER ERROR] Erreur lors du nettoyage de la RAM');
+    }
+  }, 60 * 1000); // Toutes les 60 secondes
+}
+
 // =========================================================================
-// 5. FONCTION KEEP-ALIVE (BDD SEULEMENT)
+// 5. KEEP-ALIVE & WATCHDOG
 // =========================================================================
+let keepAliveTimer = null;
 function startKeepAlive(intervalMs = 5 * 60 * 1000) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
-  logger.info({ intervalMs }, '⏱️ [KEEP-ALIVE] Démarrage de la boucle Keep-Alive BDD');
-
   keepAliveTimer = setInterval(async () => {
     if (pool) {
-      try {
-        await queryWithTimeout('SELECT 1');
-        logger.info('🟢 [KEEP-ALIVE PING] Ping Base de Données réussi.');
-      } catch (err) {
-        logger.error({ err }, '🔴 [KEEP-ALIVE PING] Échec du ping Base de Données.');
-      }
+      try { await queryWithTimeout('SELECT 1'); } catch (err) {}
     }
   }, intervalMs);
 }
 
-// =========================================================================
-// 5bis. WATCHDOG SOCKET WHATSAPP (CORRECTIF PRINCIPAL DU GEL A 10-15 MIN)
-// =========================================================================
 const WATCHDOG_INTERVAL_MS = 60 * 1000;
-const WATCHDOG_TIMEOUT_MS = 15 * 1000;
 let watchdogTimer = null;
 let lastMessageEventAt = Date.now();
 
 function startWatchdog() {
   if (watchdogTimer) clearInterval(watchdogTimer);
-  logger.info('🐕 [WATCHDOG] Démarrage de la surveillance active du socket WhatsApp (toutes les 60s).');
-
   watchdogTimer = setInterval(async () => {
     if (!sock || isReconnecting) return;
-
-    const silenceMs = Date.now() - lastMessageEventAt;
     try {
       await Promise.race([
         sock.sendPresenceUpdate('available'),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout watchdog (15s)')), WATCHDOG_TIMEOUT_MS)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000)),
       ]);
     } catch (err) {
-      logger.error({ err, silenceMs }, '💀 [WATCHDOG] Socket semble MORT (zombie) - redémarrage forcé du socket.');
-      try {
-        sock?.end?.(new Error('watchdog: socket zombie détecté'));
-      } catch (e) {}
+      try { sock?.end?.(new Error('watchdog')); } catch (e) {}
       isReconnecting = false;
       startSock().catch(e => {});
     }
@@ -250,30 +243,14 @@ function startWatchdog() {
 }
 startWatchdog();
 
-// =========================================================================
-// 5ter. AUTO-PING GROUPE CONFIGURÉ (ANTI-INACTIVITÉ 5MIN)
-// =========================================================================
 let groupPingTimer = null;
-
 function startGroupPing(intervalMs = 5 * 60 * 1000) {
   if (groupPingTimer) clearInterval(groupPingTimer);
-  logger.info({ intervalMs }, '⏱️ [GROUP PING] Démarrage de l\'auto-ping de groupe (toutes les 5 min)');
-
   groupPingTimer = setInterval(async () => {
-    if (!sock || isReconnecting) return;
-    
-    if (!targetPingGroupJid) {
-      logger.debug('ℹ️ [GROUP PING] Aucun groupe cible configuré pour le ping automatique.');
-      return;
-    }
-
+    if (!sock || isReconnecting || !targetPingGroupJid) return;
     try {
-      logger.info({ targetPingGroupJid }, '📤 [GROUP PING] Envoi du message automatique anti-inactivité dans le groupe...');
-      await sock.sendMessage(targetPingGroupJid, { text: '🤖 [Auto-Ping Anti-Inactivité] Le bot est bien en ligne !' });
-      logger.info('✅ [GROUP PING] Message anti-inactivité envoyé avec succès dans le groupe.');
-    } catch (err) {
-      logger.error({ err, targetPingGroupJid }, '❌ [GROUP PING] Échec de l\'envoi du message de ping dans le groupe');
-    }
+      await sock.sendMessage(targetPingGroupJid, { text: '🤖 [Auto-Ping Anti-Inactivité] Le bot est en ligne !' });
+    } catch (err) {}
   }, intervalMs);
 }
 
@@ -313,7 +290,6 @@ async function resolveTargetNumber(msg) {
 // 7. SOCKET WHATSAPP
 // =========================================================================
 let sock = null;
-let processingMessages = new Set();
 let isReconnecting = false;
 
 async function startSock() {
@@ -371,6 +347,7 @@ async function startSock() {
       
       startKeepAlive(5 * 60 * 1000);
       startGroupPing(5 * 60 * 1000);
+      startMemoryCleaner(); // Lancement du nettoyage de RAM actif
 
       setTimeout(async () => {
         await refreshCaches();
@@ -381,6 +358,7 @@ async function startSock() {
       isReconnecting = false;
       if (keepAliveTimer) clearInterval(keepAliveTimer);
       if (groupPingTimer) clearInterval(groupPingTimer);
+      if (memoryCleanTimer) clearInterval(memoryCleanTimer);
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -417,39 +395,7 @@ async function startSock() {
 }
 
 // =========================================================================
-// 8. XP BATCHING (TRANSFERT BDD)
-// =========================================================================
-let pendingXP = new Map();
-
-async function flushPendingXP() {
-  if (!pool || pendingXP.size === 0) return;
-  
-  const batch = new Map(pendingXP);
-  pendingXP.clear();
-  
-  for (const [key, count] of batch) {
-    const [groupJid, phoneNumber] = key.split('|');
-    if (!phoneNumber) continue;
-    
-    try {
-      await queryWithTimeout(
-        `UPDATE users 
-         SET xp = xp + $2,
-             level = floor((xp + $2)/500) + 1
-         WHERE phone_number = $1`,
-        [phoneNumber, count]
-      );
-    } catch (err) {}
-  }
-}
-setInterval(flushPendingXP, 60 * 1000);
-
-setInterval(() => {
-  if (processingMessages.size > 2000) processingMessages.clear();
-}, 10 * 60 * 1000);
-
-// =========================================================================
-// 9. TRAITEMENT DES MESSAGES
+// 8. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
   if (!msg || !msg.message || msg.message.protocolMessage || msg.messageStubType) return;
@@ -492,12 +438,11 @@ async function handleIncomingMessage(sockInstance, msg) {
 }
 
 // =========================================================================
-// 10. COMMANDES
+// 9. COMMANDES
 // =========================================================================
 async function handleCommand(sockInstance, msg, chatJid, body) {
   const [raw, ...args] = body.split(/\s+/);
   const command = raw.toLowerCase();
-  
   const senderNumber = senderNumberFromMsg(msg);
 
   const reply = async (text) => {
@@ -626,10 +571,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         );
 
         targetPingGroupJid = chatJid;
-        logger.info({ chatJid }, '🎯 [PING GROUP] Nouveau groupe de ping configuré avec succès');
         await reply(`✅ Ce groupe a été défini avec succès comme cible pour l'auto-ping anti-inactivité (toutes les 5 min).`);
       } catch (err) {
-        logger.error({ err }, '❌ [DB ERROR] Échec /set-ping-group');
         await reply('Erreur lors de l\'enregistrement du groupe de ping.');
       }
       break;
@@ -823,7 +766,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 }
 
 // =========================================================================
-// 11. DÉMARRAGE ET ARRÊT PROPRE
+// 10. DÉMARRAGE ET ARRÊT PROPRE
 // =========================================================================
 startSock().catch(err => {});
 
@@ -834,7 +777,20 @@ async function shutdown(signal) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (groupPingTimer) clearInterval(groupPingTimer);
   if (selfPingTimer) clearInterval(selfPingTimer);
-  await flushPendingXP();
+  if (memoryCleanTimer) clearInterval(memoryCleanTimer);
+  
+  // Sauvegarde finale avant coupure
+  try {
+    if (pendingXP.size > 0 && pool) {
+      for (const [key, count] of pendingXP) {
+        const [_, phoneNumber] = key.split('|');
+        if (phoneNumber) {
+          await pool.query(`UPDATE users SET xp = xp + $2 WHERE phone_number = $1`, [phoneNumber, count]);
+        }
+      }
+    }
+  } catch (e) {}
+
   if (pool) {
     await pool.end();
   }
