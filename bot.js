@@ -24,6 +24,8 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
+  initAuthCreds,
+  proto,
 } = require('@whiskeysockets/baileys');
 
 // =========================================================================
@@ -283,7 +285,89 @@ async function resolveTargetNumber(msg) {
 }
 
 // =========================================================================
-// 7. SOCKET WHATSAPP
+// 7. AUTHENTIFICATION BAILEYS STOCKÉE DANS SUPABASE (PERSISTANCE RENDER)
+// =========================================================================
+async function useSupabaseAuthState() {
+  // S'assure que la table des sessions existe
+  try {
+    await queryWithTimeout(`
+      CREATE TABLE IF NOT EXISTS bot_sessions (
+        session_id VARCHAR(255) PRIMARY KEY,
+        session_data TEXT NOT NULL
+      )
+    `);
+  } catch (e) {}
+
+  const writeData = async (data, id) => {
+    const jsonString = JSON.stringify(data, (_, val) => Buffer.isBuffer(val) ? { type: 'Buffer', data: Array.from(val) } : val);
+    await queryWithTimeout(
+      `INSERT INTO bot_sessions (session_id, session_data) VALUES ($1, $2) ON CONFLICT (session_id) DO UPDATE SET session_data = EXCLUDED.session_data`,
+      [id, jsonString]
+    );
+  };
+
+  const readData = async (id) => {
+    try {
+      const res = await queryWithTimeout(`SELECT session_data FROM bot_sessions WHERE session_id = $1`, [id]);
+      if (res.rows.length === 0) return null;
+      const data = JSON.parse(res.rows[0].session_data, (_, val) => {
+        if (val !== null && typeof val === 'object' && val.type === 'Buffer' && Array.isArray(val.data)) {
+          return Buffer.from(val.data);
+        }
+        return val;
+      });
+      return data;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const removeData = async (id) => {
+    try {
+      await queryWithTimeout(`DELETE FROM bot_sessions WHERE session_id = $1`, [id]);
+    } catch (error) {}
+  };
+
+  const creds = (await readData('creds')) || (await initAuthCreds());
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            let value = await readData(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const category of Object.keys(data)) {
+            for (const id of Object.keys(data[category])) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              if (value) {
+                tasks.push(writeData(value, key));
+              } else {
+                tasks.push(removeData(key));
+              }
+            }
+          }
+          await Promise.all(tasks);
+        }
+      }
+    },
+    saveCreds: () => writeData(state.creds, 'creds')
+  };
+}
+
+// =========================================================================
+// 8. SOCKET WHATSAPP
 // =========================================================================
 let sock = null;
 let isReconnecting = false;
@@ -299,8 +383,7 @@ async function startSock() {
     } catch (e) {}
   }
 
-  const authDir = path.join(__dirname, '.baileys_auth');
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { state, saveCreds } = await useSupabaseAuthState();
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
@@ -364,9 +447,10 @@ async function startSock() {
       } else if (shouldReconnect) {
         setTimeout(() => startSock(), 5000);
       } else {
-        if (fs.existsSync(authDir)) {
-          try { fs.rmSync(authDir, { recursive: true, force: true }); } catch (e) {}
-        }
+        // En cas de déconnexion totale (loggedOut), on nettoie la table en BDD
+        try {
+          await queryWithTimeout('DELETE FROM bot_sessions');
+        } catch (e) {}
         setTimeout(() => startSock(), 3000);
       }
     }
@@ -391,7 +475,7 @@ async function startSock() {
 }
 
 // =========================================================================
-// 8. TRAITEMENT DES MESSAGES
+// 9. TRAITEMENT DES MESSAGES
 // =========================================================================
 async function handleIncomingMessage(sockInstance, msg) {
   if (!msg || !msg.message || msg.message.protocolMessage || msg.messageStubType) return;
@@ -434,7 +518,7 @@ async function handleIncomingMessage(sockInstance, msg) {
 }
 
 // =========================================================================
-// 9. COMMANDES
+// 10. COMMANDES
 // =========================================================================
 async function handleCommand(sockInstance, msg, chatJid, body) {
   const [raw, ...args] = body.split(/\s+/);
@@ -762,7 +846,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 }
 
 // =========================================================================
-// 10. DÉMARRAGE ET ARRÊT PROPRE
+// 11. DÉMARRAGE ET ARRÊT PROPRE
 // =========================================================================
 startSock().catch(err => {});
 
