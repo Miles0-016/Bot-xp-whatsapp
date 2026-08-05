@@ -1,5 +1,5 @@
 /**
- * bot.js - Bot WhatsApp XP avec Baileys (Traçabilité & Shield Anti-Crash)
+ * bot.js - Bot WhatsApp XP avec Baileys & Auto-Ping Anti-Inactivité (Render)
  */
 
 // =========================================================================
@@ -15,6 +15,7 @@ const express = require('express');
 const QRCode = require('qrcode');
 const { Pool } = require('pg');
 const pino = require('pino');
+const http = require('http'); // Nécessaire pour l'auto-ping interne
 
 // Baileys
 const {
@@ -50,13 +51,14 @@ else logger.info({ superAdmins: SUPER_ADMIN_NUMBERS }, 'ℹ️ [CONFIG] Super Ad
 let currentQRCodeBase64 = null;
 let BOT_NUMBER = null;
 let keepAliveTimer = null;
+let selfPingTimer = null;
 
 // Anti-crash global
 process.on('uncaughtException', err => logger.error({ err }, '💥 [CRITICAL] Uncaught Exception intercepté'));
 process.on('unhandledRejection', reason => logger.error({ reason }, '💥 [CRITICAL] Unhandled Rejection intercepté'));
 
 // =========================================================================
-// 2. SERVEUR EXPRESS
+// 2. SERVEUR EXPRESS & AUTO-PING INTERNE (RENDER KEEP-ALIVE)
 // =========================================================================
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -74,7 +76,7 @@ app.get('/', (req, res) => {
       </html>
     `);
   } else {
-    res.send('<html><body style="background:#0f172a;color:#4ade80;display:flex;justify-content:center;align-items:center;height:100vh;"><h2>✅ Bot en ligne</h2></body></html>');
+    res.send('<html><body style="background:#0f172a;color:#4ade80;display:flex;justify-content:center;align-items:center;height:100vh;"><h2>✅ Bot en ligne 24h/24</h2></body></html>');
   }
 });
 
@@ -94,7 +96,24 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   logger.info(`🚀 [HTTP] Serveur Express démarré sur le port ${PORT}`);
+  startSelfPing(); // Démarrage de l'auto-ping anti-veille Render
 });
+
+// Fonction pour auto-pinger l'application Render toutes les 4 minutes et empêcher la mise en veille
+function startSelfPing() {
+  const appUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  if (selfPingTimer) clearInterval(selfPingTimer);
+  
+  logger.info({ appUrl }, '⏱️ [SELF-PING] Démarrage du mécanisme anti-inactivité Render (toutes les 4 min)');
+
+  selfPingTimer = setInterval(() => {
+    http.get(`${appUrl}/health`, (res) => {
+      logger.info({ statusCode: res.statusCode }, '🟢 [SELF-PING] Auto-ping HTTP réussi, l\'application reste active.');
+    }).on('err', (err) => {
+      logger.error({ err }, '🔴 [SELF-PING] Échec de l\'auto-ping HTTP.');
+    });
+  }, 4 * 60 * 1000); // Toutes les 4 minutes
+}
 
 // =========================================================================
 // 3. BASE DE DONNÉES SUPABASE
@@ -156,14 +175,12 @@ async function refreshCaches() {
     const admins = await queryWithTimeout('SELECT phone_number FROM bot_admins');
     const newAdmins = new Set(admins.rows.map(r => r.phone_number));
 
-    // Récupérer le groupe de ping configuré depuis la BDD (on stocke ça dans une table de config ou paramètre global)
     try {
       const configRes = await queryWithTimeout("SELECT value FROM bot_config WHERE key = 'ping_target_group'");
       if (configRes.rows.length > 0) {
         targetPingGroupJid = configRes.rows[0].value;
       }
     } catch (e) {
-      // Table bot_config absente ou ignorée, on gère silencieusement
       logger.debug('ℹ️ [CONFIG] Table bot_config non initialisée, pas de groupe de ping pré-enregistré.');
     }
 
@@ -353,7 +370,7 @@ async function startSock() {
       logger.info(`🎉 [CONNEXION SUCCÈS] Connecté à WhatsApp ! Numéro du Bot : ${BOT_NUMBER}`);
       
       startKeepAlive(5 * 60 * 1000);
-      startGroupPing(5 * 60 * 1000); // Lancement de l'auto-ping de groupe toutes les 5 min
+      startGroupPing(5 * 60 * 1000);
 
       setTimeout(async () => {
         await refreshCaches();
@@ -568,7 +585,6 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         await queryWithTimeout('DELETE FROM authorized_groups WHERE group_jid = $1', [chatJid]);
         cachedGroups.delete(chatJid);
         
-        // Si c'était le groupe de ping, on le retire aussi
         if (targetPingGroupJid === chatJid) {
           targetPingGroupJid = null;
           await queryWithTimeout("DELETE FROM bot_config WHERE key = 'ping_target_group'");
@@ -596,7 +612,6 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       }
 
       try {
-        // S'assurer que la table bot_config existe pour stocker ce paramètre global
         await queryWithTimeout(`
           CREATE TABLE IF NOT EXISTS bot_config (
             key VARCHAR(50) PRIMARY KEY,
@@ -818,6 +833,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (groupPingTimer) clearInterval(groupPingTimer);
+  if (selfPingTimer) clearInterval(selfPingTimer);
   await flushPendingXP();
   if (pool) {
     await pool.end();
