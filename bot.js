@@ -173,10 +173,9 @@ function startMemoryCleaner() {
 
   memoryCleanTimer = setInterval(async () => {
     try {
-      // 1. Sauvegarde et vidage du cache XP en attente
       if (pendingXP.size > 0) {
         const batch = new Map(pendingXP);
-        pendingXP.clear(); // Vidage immédiat de la RAM
+        pendingXP.clear();
         
         for (const [key, count] of batch) {
           const [groupJid, phoneNumber] = key.split('|');
@@ -191,12 +190,10 @@ function startMemoryCleaner() {
         logger.info('💾 [RAM CLEANER] Données XP flushées et purgées de la RAM.');
       }
 
-      // 2. Vidage des messages traités en double pour éviter l'accumulation
       if (processingMessages.size > 0) {
         processingMessages.clear();
       }
 
-      // 3. Demande au Garbage Collector de Node.js de nettoyer si disponible
       if (global.gc) {
         global.gc();
       }
@@ -205,13 +202,12 @@ function startMemoryCleaner() {
     } catch (err) {
       logger.error({ err }, '❌ [RAM CLEANER ERROR] Erreur lors du nettoyage de la RAM');
     }
-  }, 60 * 1000); // Toutes les 60 secondes
+  }, 60 * 1000);
 }
 
 // =========================================================================
 // 5. KEEP-ALIVE & WATCHDOG
 // =========================================================================
-let keepAliveTimer = null;
 function startKeepAlive(intervalMs = 5 * 60 * 1000) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   keepAliveTimer = setInterval(async () => {
@@ -347,7 +343,7 @@ async function startSock() {
       
       startKeepAlive(5 * 60 * 1000);
       startGroupPing(5 * 60 * 1000);
-      startMemoryCleaner(); // Lancement du nettoyage de RAM actif
+      startMemoryCleaner();
 
       setTimeout(async () => {
         await refreshCaches();
@@ -779,7 +775,6 @@ async function shutdown(signal) {
   if (selfPingTimer) clearInterval(selfPingTimer);
   if (memoryCleanTimer) clearInterval(memoryCleanTimer);
   
-  // Sauvegarde finale avant coupure
   try {
     if (pendingXP.size > 0 && pool) {
       for (const [key, count] of pendingXP) {
