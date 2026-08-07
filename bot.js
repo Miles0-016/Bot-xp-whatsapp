@@ -209,7 +209,7 @@ function startMemoryCleaner() {
 }
 
 // =========================================================================
-// 5. KEEP-ALIVE & WATCHDOG & TÂCHES PLANIFIÉES (CRON TOP 10)
+// 5. KEEP-ALIVE & WATCHDOG & TÂCHES PLANIFIÉES (CRON CLASSEMENT COMPLET)
 // =========================================================================
 function startKeepAlive(intervalMs = 5 * 60 * 1000) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
@@ -253,24 +253,24 @@ function startGroupPing(intervalMs = 5 * 60 * 1000) {
   }, intervalMs);
 }
 
-// Planification automatique du Top 10 à minuit (00:00) et midi (12:00)
+// Planification automatique du classement complet à minuit (00:00) et midi (12:00)
 cron.schedule('0 0,12 * * *', async () => {
   if (!sock || isReconnecting) return;
   try {
     const groupsRes = await queryWithTimeout('SELECT group_jid FROM authorized_groups');
     if (!groupsRes || groupsRes.rows.length === 0) return;
 
-    const topRes = await queryWithTimeout('SELECT phone_number, username, xp, level FROM users ORDER BY xp DESC LIMIT 10');
+    const topRes = await queryWithTimeout('SELECT phone_number, username, xp, level FROM users ORDER BY xp DESC');
     if (!topRes || topRes.rows.length === 0) return;
 
-    let message = `🏆 *TOP 10 DU CLASSEMENT* 🏆\n\n`;
+    let message = `🏆 *CLASSEMENT COMPLET DES MEMBRES* 🏆\n\n`;
     const mentions = [];
 
     topRes.rows.forEach((m, i) => {
       const medal = MEDALS[i] || `🔹`;
       const userJid = `${m.phone_number}@s.whatsapp.net`;
       mentions.push(userJid);
-      message += `${medal} *${i + 1}.* ${m.username} - @${m.phone_number} (*${m.xp} XP* - Niv. ${m.level})\n`;
+      message += `${medal} *${i + 1}.* ${m.username} (*${m.xp} XP* - Niv. ${m.level})\n`;
     });
 
     for (const g of groupsRes.rows) {
@@ -580,7 +580,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 👤 *MEMBRES & STATS*
 🔹 */xp [@membre]* : Affiche le niveau/XP.
 🔹 */sign <pseudo> [@membre]* : S'inscrire ou inscrire un membre.
-🔹 */top* : TOP 20 des membres les plus actifs.
+🔹 */top* : Classement complet de tous les membres.
 ℹ️ */id* ou */jid* : Afficher l'identifiant du groupe.`;
 
       if (isAdmin) {
@@ -607,8 +607,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       break;
 
     case '/activer-groupe': {
-      // Réservé aux admins du bot / super admins (remplacement de la modification de soldes)
-      if (!isBotAdmin(senderNumber)) {
+      // Les Super Admins et admins ont accès
+      if (!isBotAdmin(senderNumber) && !isSuper) {
         await reply(`Accès refusé. Réservé aux administrateurs.`);
         return;
       }
@@ -631,8 +631,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     }
 
     case '/desactiver-groupe': {
-      // Réservé aux admins du bot / super admins
-      if (!isBotAdmin(senderNumber)) {
+      if (!isBotAdmin(senderNumber) && !isSuper) {
         await reply('Accès refusé. Réservé aux administrateurs.');
         return;
       }
@@ -687,9 +686,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 
     case '/addxp':
     case '/removexp': {
-      // Commande de modification des soldes/XP désormais bloquée pour les admins simples, réservée aux Super Admins / Bot uniquement
-      if (!isBot && !isSuper) {
-        await reply('Accès refusé. Les administrateurs ne peuvent plus modifier les soldes (réservé aux Super Admins). Utilisez plutôt /activer-groupe ou /desactiver-groupe.');
+      if (!isBot && !isSuper && !isBotAdmin(senderNumber)) {
+        await reply('Accès refusé.');
         return;
       }
       const amount = parseInt(args.find(a => /^\d+$/.test(a)), 10);
@@ -744,7 +742,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       let newUsername;
 
       if (hasMention) {
-        if (!isBotAdmin(senderNumber)) {
+        if (!isBotAdmin(senderNumber) && !isSuper) {
           await reply('Seul un Admin du bot peut inscrire un autre membre.');
           return;
         }
@@ -779,7 +777,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     }
 
     case '/add-admin':
-      if (!isSuperAdminNumber(senderNumber)) {
+      if (!isSuperAdminNumber(senderNumber) && !isSuper) {
         await reply('Seul un Super Admin peut faire cela.');
         return;
       }
@@ -805,7 +803,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       break;
 
     case '/remove-admin':
-      if (!isSuperAdminNumber(senderNumber)) {
+      if (!isSuperAdminNumber(senderNumber) && !isSuper) {
         await reply('Seul un Super Admin me permet de faire cela.');
         return;
       }
@@ -852,14 +850,14 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     case '/top':
     case '/leaderboard': {
       try {
-        const res = await queryWithTimeout('SELECT * FROM users ORDER BY xp DESC LIMIT 20');
+        const res = await queryWithTimeout('SELECT * FROM users ORDER BY xp DESC');
         if (res.rows.length === 0) {
           await reply('Aucun membre inscrit pour le moment.');
           return;
         }
         const lines = res.rows.map((m, i) => {
           const medal = MEDALS[i] || `#${i+1}`;
-          return `${medal} ${m.username} - @${m.phone_number} - ${m.xp} XP (Niv. ${m.level})`;
+          return `${medal} ${m.username} - ${m.xp} XP (Niv. ${m.level})`;
         });
         const mentions = res.rows.map(m => `${m.phone_number}@s.whatsapp.net`);
         await sockInstance.sendMessage(chatJid, { text: `🏆 Classement XP 🏆\n\n${lines.join('\n')}`, mentions }, { quoted: msg });
