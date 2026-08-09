@@ -40,7 +40,7 @@ const logger = pino({
     : { target: 'pino-pretty', options: { colorize: false, translateTime: 'SYS:standard' } },
 });
 
-const MAX_GROUPS = 5;
+const MAX_GROUPS = 20; // [MODIFIÉ] Limite portée à 20 groupes
 const XP_PER_MESSAGE = 1;
 const MEDALS = ['🥇', '🥈', '🥉'];
 
@@ -302,6 +302,7 @@ function isSuperAdminNumber(n) {
 }
 
 function isBotAdmin(n) { 
+  // Les Super Admins sont automatiquement considérés comme des admins du bot
   return isSuperAdminNumber(n) || cachedAdmins.has(n); 
 }
 
@@ -571,7 +572,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
   // Filtrage dynamique du menu selon les permissions de l'expéditeur
   const isBot = BOT_NUMBER && senderNumber === BOT_NUMBER;
   const isSuper = isSuperAdminNumber(senderNumber);
-  const isAdmin = isBotAdmin(senderNumber);
+  const isAdmin = isBotAdmin(senderNumber); // Contient aussi isSuper grâce à isBotAdmin mis à jour
 
   switch (command) {
     case '/menu': {
@@ -607,8 +608,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       break;
 
     case '/activer-groupe': {
-      // Les Super Admins et admins ont accès
-      if (!isBotAdmin(senderNumber) && !isSuper) {
+      // [MODIFIÉ] Les Super Admins ont désormais accès à toutes les commandes (via isSuper)
+      if (!isBot && !isSuper && !isBotAdmin(senderNumber)) {
         await reply(`Accès refusé. Réservé aux administrateurs.`);
         return;
       }
@@ -631,7 +632,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     }
 
     case '/desactiver-groupe': {
-      if (!isBotAdmin(senderNumber) && !isSuper) {
+      // [MODIFIÉ] Accès étendu aux Super Admins
+      if (!isBot && !isSuper && !isBotAdmin(senderNumber)) {
         await reply('Accès refusé. Réservé aux administrateurs.');
         return;
       }
@@ -652,6 +654,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     }
 
     case '/set-ping-group': {
+      // [MODIFIÉ] Accès étendu aux Super Admins et bot
       if (!isBot && !isSuper) {
         await reply('Accès refusé. Réservé aux super admins.');
         return;
@@ -686,6 +689,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
 
     case '/addxp':
     case '/removexp': {
+      // [MODIFIÉ] Accès étendu aux Super Admins explicitement
       if (!isBot && !isSuper && !isBotAdmin(senderNumber)) {
         await reply('Accès refusé.');
         return;
@@ -713,7 +717,7 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
         );
         
         if (result.rowCount === 0) {
-          await reply(`⚠️ Ce membre (@${targetNumber}) n'est pas encore inscrit.`);
+          await reply(`⚠️ @${targetNumber} n'est pas encore inscrit.`);
           return;
         }
 
@@ -742,7 +746,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       let newUsername;
 
       if (hasMention) {
-        if (!isBotAdmin(senderNumber) && !isSuper) {
+        // [MODIFIÉ] Accès étendu aux Super Admins
+        if (!isBot && !isSuper && !isBotAdmin(senderNumber)) {
           await reply('Seul un Admin du bot peut inscrire un autre membre.');
           return;
         }
@@ -777,7 +782,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
     }
 
     case '/add-admin':
-      if (!isSuperAdminNumber(senderNumber) && !isSuper) {
+      // [MODIFIÉ] Utilisation de isSuper directement
+      if (!isBot && !isSuper && !isSuperAdminNumber(senderNumber)) {
         await reply('Seul un Super Admin peut faire cela.');
         return;
       }
@@ -803,7 +809,8 @@ async function handleCommand(sockInstance, msg, chatJid, body) {
       break;
 
     case '/remove-admin':
-      if (!isSuperAdminNumber(senderNumber) && !isSuper) {
+      // [MODIFIÉ] Utilisation de isSuper directement
+      if (!isBot && !isSuper && !isSuperAdminNumber(senderNumber)) {
         await reply('Seul un Super Admin me permet de faire cela.');
         return;
       }
