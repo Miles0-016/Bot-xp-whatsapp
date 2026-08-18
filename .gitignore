@@ -1,0 +1,6 @@
+node_modules/
+.env
+*.log
+.wwebjs_auth/
+.baileys_auth/
+.DS_Store

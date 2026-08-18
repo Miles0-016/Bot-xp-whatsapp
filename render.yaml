@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: xp-whatsapp-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPER_ADMIN_NUMBERS
+        sync: false
+    disk:
+      name: baileys-auth
+      mountPath: /app/.baileys_auth
+      sizeGB: 1
